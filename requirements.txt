@@ -1,0 +1,24 @@
+# Core
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.9
+pydantic-settings>=2.2.1
+
+# STT Engine - PyTorch 2.6+ for RTX 5090 (sm_120) support
+faster-whisper>=1.0.3
+torch>=2.6.0
+torchaudio>=2.6.0
+torchcodec>=0.1.0
+
+# Hugging Face - pin version compatible with pyannote
+huggingface_hub>=0.24.0,<0.27.0
+
+# Diarization
+pyannote.audio>=3.3.2
+speechbrain>=1.0.0
+
+# Utils
+pydub>=0.25.1
+python-dotenv>=1.0.1
+aiofiles>=23.2.1
+numpy<2.0

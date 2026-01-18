@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MyWhisper - Transcription Audio</title>
+    <link rel="stylesheet" href="/static/styles.css?v=5">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+</head>
+<body x-data="sttApp()" x-init="init()">
+    <!-- Background effects -->
+    <div class="bg-grid"></div>
+    <div class="bg-glow bg-glow-1"></div>
+    <div class="bg-glow bg-glow-2"></div>
+    
+    <main class="container">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <div class="logo-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
+                        <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                        <line x1="12" x2="12" y1="19" y2="22"/>
+                    </svg>
+                </div>
+                <h1>MyWhisper</h1>
+            </div>
+            <p class="subtitle">Transcription audio intelligente avec IA</p>
+        </header>
+        
+        <!-- Tabs Navigation -->
+        <div class="tabs-nav">
+            <button class="tab-btn" :class="{ 'active': activeTab === 'file' }" @click="activeTab = 'file'">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/>
+                    <polyline points="13 2 13 9 20 9"/>
+                </svg>
+                Fichier
+            </button>
+            <button class="tab-btn" :class="{ 'active': activeTab === 'dictation' }" @click="activeTab = 'dictation'">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
+                    <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                    <line x1="12" x2="12" y1="19" y2="22"/>
+                </svg>
+                Dictée
+            </button>
+            <button class="tab-btn" :class="{ 'active': activeTab === 'settings' }" @click="activeTab = 'settings'">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="3"/>
+                    <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+                </svg>
+                Paramètres
+            </button>
+        </div>
+        
+        <!-- File Tab Content -->
+        <div class="tab-content" x-show="activeTab === 'file'" x-transition>
+        
+        <!-- Upload Zone -->
+        <div class="upload-section">
+            <div class="dropzone" 
+                 @drop.prevent="handleDrop($event)"
+                 @dragover.prevent="dragActive = true"
+                 @dragenter.prevent="dragActive = true"
+                 @dragleave.prevent="dragActive = false"
+                 :class="{ 'drag-active': dragActive, 'has-file': selectedFile }">
+                
+                <input type="file" 
+                       id="fileInput" 
+                       accept=".mp3,.wav,.m4a,.flac,.ogg,.webm,.mp4"
+                       @change="handleFileSelect($event)"
+                       hidden>
+                
+                <div class="dropzone-content" x-show="!selectedFile">
+                    <div class="dropzone-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/>
+                            <path d="M12 12v9"/>
+                            <path d="m8 17 4-4 4 4"/>
+                        </svg>
+                    </div>
+                    <label for="fileInput" class="dropzone-label">
+                        <span class="dropzone-title">Déposez votre fichier audio ici</span>
+                        <span class="dropzone-hint">ou cliquez pour parcourir</span>
+                    </label>
+                    <div class="dropzone-formats">
+                        MP3 • WAV • M4A • FLAC • OGG • WEBM
+                    </div>
+                </div>
+                
+                <div class="file-preview" x-show="selectedFile">
+                    <div class="file-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                            <path d="M9 18V5l12-2v13"/>
+                            <circle cx="6" cy="18" r="3"/>
+                            <circle cx="18" cy="16" r="3"/>
+                        </svg>
+                    </div>
+                    <div class="file-info">
+                        <span class="file-name" x-text="selectedFile?.name"></span>
+                        <span class="file-size" x-text="formatFileSize(selectedFile?.size)"></span>
+                    </div>
+                    <button class="file-remove" @click.stop="removeFile()">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <line x1="18" y1="6" x2="6" y2="18"/>
+                            <line x1="6" y1="6" x2="18" y2="18"/>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Options Panel -->
+        <div class="options-panel">
+            <div class="option-group">
+                <label class="option-label">
+                    <span class="option-icon">🌍</span>
+                    Langue
+                </label>
+                <select x-model="options.language" class="select-input">
+                    <option value="">Détection automatique</option>
+                    <option value="fr">Français</option>
+                    <option value="en">English</option>
+                    <option value="es">Español</option>
+                    <option value="de">Deutsch</option>
+                    <option value="it">Italiano</option>
+                    <option value="pt">Português</option>
+                    <option value="nl">Nederlands</option>
+                    <option value="pl">Polski</option>
+                    <option value="ru">Русский</option>
+                    <option value="ja">日本語</option>
+                    <option value="zh">中文</option>
+                    <option value="ar">العربية</option>
+                </select>
+            </div>
+            
+            <div class="option-group">
+                <label class="option-label">
+                    <span class="option-icon">📄</span>
+                    Format
+                </label>
+                <select x-model="options.format" class="select-input">
+                    <option value="json">JSON (complet)</option>
+                    <option value="text">Texte brut</option>
+                    <option value="srt">SRT (sous-titres)</option>
+                    <option value="vtt">VTT (web)</option>
+                </select>
+            </div>
+            
+            <div class="option-group">
+                <label class="toggle-label">
+                    <input type="checkbox" x-model="options.diarize" class="toggle-input">
+                    <span class="toggle-switch"></span>
+                    <span class="toggle-text">
+                        <span class="option-icon">👥</span>
+                        Diarisation
+                    </span>
+                </label>
+                <span class="option-hint">Identifier les intervenants</span>
+            </div>
+            
+            <!-- Speaker constraints (shown when diarization is enabled) -->
+            <div class="option-group speaker-options" x-show="options.diarize" x-transition>
+                <label class="option-label">
+                    <span class="option-icon">⚡</span>
+                    Nb. locuteurs (optionnel)
+                </label>
+                <div class="speaker-inputs">
+                    <input type="number" 
+                           x-model="options.minSpeakers" 
+                           class="number-input" 
+                           placeholder="Min"
+                           min="1" 
+                           max="20">
+                    <span class="speaker-separator">à</span>
+                    <input type="number" 
+                           x-model="options.maxSpeakers" 
+                           class="number-input" 
+                           placeholder="Max"
+                           min="1" 
+                           max="20">
+                </div>
+                <span class="option-hint">Accélère le traitement si connu</span>
+            </div>
+            
+            <!-- Auto-save option -->
+            <div class="option-group">
+                <label class="toggle-label">
+                    <input type="checkbox" x-model="saveOptions.enabled" class="toggle-input">
+                    <span class="toggle-switch"></span>
+                    <span class="toggle-text">
+                        <span class="option-icon">💾</span>
+                        Sauvegarde automatique
+                    </span>
+                </label>
+                <span class="option-hint">Télécharger le résultat automatiquement</span>
+            </div>
+            
+            <!-- Save path selection (shown when auto-save is enabled) -->
+            <div class="option-group save-options" x-show="saveOptions.enabled" x-transition>
+                <label class="option-label">
+                    <span class="option-icon">📁</span>
+                    Dossier de destination
+                </label>
+                <div class="save-path-container">
+                    <button class="choose-folder-btn" @click="chooseSaveFolder()">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+                        </svg>
+                        <span x-text="saveOptions.folderHandle ? 'Changer le dossier' : 'Choisir un dossier'"></span>
+                    </button>
+                    <div class="save-path-display" x-show="saveOptions.folderName">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+                        </svg>
+                        <span x-text="saveOptions.folderName"></span>
+                    </div>
+                </div>
+                <span class="option-hint" x-show="!saveOptions.folderHandle">Sans dossier : téléchargement standard</span>
+                <span class="option-hint success" x-show="saveOptions.folderHandle">✓ Sauvegarde directe dans ce dossier</span>
+            </div>
+        </div>
+        
+        <!-- Transcribe Button -->
+        <button class="transcribe-btn" 
+                @click="startTranscription()"
+                :disabled="!selectedFile || processing"
+                :class="{ 'processing': processing }">
+            <span x-show="!processing" class="btn-content">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polygon points="5 3 19 12 5 21 5 3"/>
+                </svg>
+                Transcrire
+            </span>
+            <span x-show="processing" class="btn-content">
+                <div class="spinner"></div>
+                Traitement en cours...
+            </span>
+        </button>
+        
+        <!-- Progress Bar -->
+        <div class="progress-container" x-show="processing" x-transition>
+            <div class="progress-header">
+                <div class="progress-status">
+                    <div class="progress-spinner"></div>
+                    <span class="progress-status-text" x-text="statusText"></span>
+                </div>
+                <span class="progress-percent" x-text="`${progress}%`"></span>
+            </div>
+            <div class="progress-bar">
+                <div class="progress-fill" :style="`width: ${progress}%`"></div>
+                <div class="progress-glow" :style="`left: ${progress}%`"></div>
+            </div>
+            <div class="progress-steps">
+                <div class="progress-step" :class="{ 'active': progress >= 0, 'done': progress > 25 }">
+                    <div class="step-dot"></div>
+                    <span>Envoi</span>
+                </div>
+                <div class="progress-step" :class="{ 'active': progress >= 25, 'done': progress > 60 }">
+                    <div class="step-dot"></div>
+                    <span>Transcription</span>
+                </div>
+                <div class="progress-step" x-show="options.diarize" :class="{ 'active': progress >= 60, 'done': progress > 85 }">
+                    <div class="step-dot"></div>
+                    <span>Diarisation</span>
+                </div>
+                <div class="progress-step" :class="{ 'active': progress >= 85, 'done': progress >= 100 }">
+                    <div class="step-dot"></div>
+                    <span>Terminé</span>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Error Message -->
+        <div class="error-message" x-show="error" x-transition>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="10"/>
+                <line x1="12" y1="8" x2="12" y2="12"/>
+                <line x1="12" y1="16" x2="12.01" y2="16"/>
+            </svg>
+            <span x-text="error"></span>
+            <button @click="error = null" class="error-close">×</button>
+        </div>
+        
+        <!-- Speakers Section (shown after diarization) -->
+        <div class="speakers-section" x-show="result && detectedSpeakers.length > 0" x-transition>
+            <div class="speakers-header">
+                <h3>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+                        <circle cx="9" cy="7" r="4"/>
+                        <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+                        <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+                    </svg>
+                    Intervenants détectés
+                </h3>
+                <span class="speakers-count" x-text="`${detectedSpeakers.length} intervenant${detectedSpeakers.length > 1 ? 's' : ''}`"></span>
+            </div>
+            
+            <div class="speakers-list">
+                <template x-for="speaker in detectedSpeakers" :key="speaker">
+                    <div class="speaker-item">
+                        <div class="speaker-id">
+                            <span class="speaker-badge" x-text="speaker"></span>
+                        </div>
+                        <div class="speaker-input-wrapper">
+                            <input type="text" 
+                                   class="speaker-name-input"
+                                   :placeholder="`Nom de ${speaker}`"
+                                   x-model="speakerNames[speaker]"
+                                   @keyup.enter="applySpeakerNames()">
+                        </div>
+                    </div>
+                </template>
+            </div>
+            
+            <div class="speakers-actions">
+                <button class="action-btn primary" 
+                        @click="applySpeakerNames()"
+                        :disabled="!hasSpeakerNames()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="20 6 9 17 4 12"/>
+                    </svg>
+                    Appliquer les noms
+                </button>
+                <button class="action-btn secondary" 
+                        @click="resetSpeakerNames()"
+                        x-show="originalResult && result !== originalResult">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="1 4 1 10 7 10"/>
+                        <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
+                    </svg>
+                    Réinitialiser
+                </button>
+            </div>
+        </div>
+        
+        <!-- Results Section -->
+        <div class="results-section" x-show="result" x-transition>
+            <div class="results-header">
+                <h2>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                        <polyline points="14 2 14 8 20 8"/>
+                        <line x1="16" y1="13" x2="8" y2="13"/>
+                        <line x1="16" y1="17" x2="8" y2="17"/>
+                    </svg>
+                    Transcription
+                </h2>
+                <div class="results-meta" x-show="resultMeta">
+                    <span x-show="resultMeta?.language">
+                        🌍 <span x-text="getLanguageName(resultMeta?.language)"></span>
+                    </span>
+                    <span x-show="resultMeta?.duration">
+                        ⏱️ <span x-text="formatDuration(resultMeta?.duration)"></span>
+                    </span>
+                </div>
+            </div>
+            
+            <div class="results-content">
+                <pre x-text="result"></pre>
+            </div>
+            
+            <div class="results-actions">
+                <button class="action-btn primary" @click="downloadResult()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                        <polyline points="7 10 12 15 17 10"/>
+                        <line x1="12" y1="15" x2="12" y2="3"/>
+                    </svg>
+                    Télécharger
+                </button>
+                <button class="action-btn secondary" @click="copyToClipboard()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                    </svg>
+                    <span x-text="copied ? 'Copié !' : 'Copier'"></span>
+                </button>
+                <button class="action-btn secondary" @click="clearResult()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="1 4 1 10 7 10"/>
+                        <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
+                    </svg>
+                    Nouveau
+                </button>
+            </div>
+            
+            <!-- LLM Reprocessing Section -->
+            <div class="llm-section" x-show="ollamaConnected && customPrompts.length > 0">
+                <div class="llm-header">
+                    <h4>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M12 2a4 4 0 0 0-4 4v2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10a2 2 0 0 0-2-2h-2V6a4 4 0 0 0-4-4z"/>
+                        </svg>
+                        Retraiter avec IA
+                    </h4>
+                    <span class="llm-model" x-text="ollamaSettings.model"></span>
+                </div>
+                <div class="llm-prompts">
+                    <template x-for="(prompt, index) in customPrompts" :key="index">
+                        <button class="llm-prompt-btn" 
+                                @click="applyLLMPrompt(index)"
+                                :disabled="llmProcessing"
+                                x-text="prompt.name || 'Prompt ' + (index + 1)">
+                        </button>
+                    </template>
+                </div>
+                <div class="llm-status" x-show="llmProcessing">
+                    <div class="spinner-small"></div>
+                    <span>Traitement en cours...</span>
+                </div>
+                
+                <!-- LLM Result -->
+                <div class="llm-result" x-show="llmResult">
+                    <div class="llm-result-header">
+                        <span class="llm-result-title">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                                <polyline points="14 2 14 8 20 8"/>
+                            </svg>
+                            Résultat IA
+                            <span class="llm-result-prompt" x-text="llmLastPrompt"></span>
+                        </span>
+                        <div class="llm-result-actions">
+                            <button class="action-btn-small" @click="copyLLMResultFormatted()" title="Copier pour Word/Outlook">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                                </svg>
+                                <span x-text="llmCopied ? 'Copié !' : 'Copier'"></span>
+                            </button>
+                            <button class="icon-btn" @click="clearLLMResult()" title="Fermer">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <line x1="18" y1="6" x2="6" y2="18"/>
+                                    <line x1="6" y1="6" x2="18" y2="18"/>
+                                </svg>
+                            </button>
+                        </div>
+                    </div>
+                    <div class="llm-result-content" id="llm-result-content" x-html="formatLLMResultForDisplay()"></div>
+                </div>
+            </div>
+        </div>
+        
+        </div><!-- End File Tab Content -->
+        
+        <!-- Dictation Tab Content -->
+        <div class="tab-content" x-show="activeTab === 'dictation'" x-transition>
+            
+            <!-- Recording Controls -->
+            <div class="dictation-section">
+                <div class="recording-status" :class="{ 'recording': isRecording }">
+                    <div class="recording-indicator">
+                        <div class="pulse-ring" x-show="isRecording"></div>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/>
+                            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+                            <line x1="12" x2="12" y1="19" y2="22"/>
+                        </svg>
+                    </div>
+                    <div class="recording-info">
+                        <span class="recording-label" x-text="isRecording ? 'Enregistrement en cours...' : 'Prêt à enregistrer'"></span>
+                        <span class="recording-time" x-show="isRecording" x-text="formatRecordingTime(recordingTime)"></span>
+                        <div class="silence-indicator" x-show="isRecording && silenceDuration > 2">
+                            <span class="silence-warning">Silence détecté...</span>
+                            <span class="silence-countdown" x-text="`Arrêt auto dans ${Math.ceil(dictationOptions.silenceTimeout - silenceDuration)}s`"></span>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Audio Level Meter -->
+                <div class="audio-meter" x-show="isRecording">
+                    <div class="audio-meter-fill" :style="`width: ${Math.min(audioLevel * 300, 100)}%`"></div>
+                </div>
+                
+                <button class="record-btn" 
+                        :class="{ 'recording': isRecording, 'processing': dictationProcessing }"
+                        @click="toggleRecording()"
+                        :disabled="dictationProcessing">
+                    <span x-show="!isRecording && !dictationProcessing" class="btn-content">
+                        <svg viewBox="0 0 24 24" fill="currentColor">
+                            <circle cx="12" cy="12" r="10"/>
+                        </svg>
+                        Démarrer
+                    </span>
+                    <span x-show="isRecording" class="btn-content">
+                        <svg viewBox="0 0 24 24" fill="currentColor">
+                            <rect x="6" y="6" width="12" height="12" rx="2"/>
+                        </svg>
+                        Arrêter
+                    </span>
+                    <span x-show="dictationProcessing" class="btn-content">
+                        <div class="spinner"></div>
+                        Traitement...
+                    </span>
+                </button>
+                
+                <!-- Dictation Options -->
+                <div class="dictation-options">
+                    <div class="option-group">
+                        <label class="option-label">
+                            <span class="option-icon">🌍</span>
+                            Langue
+                        </label>
+                        <select x-model="dictationOptions.language" class="select-input">
+                            <option value="">Détection automatique</option>
+                            <option value="fr">Français</option>
+                            <option value="en">English</option>
+                            <option value="es">Español</option>
+                            <option value="de">Deutsch</option>
+                            <option value="it">Italiano</option>
+                        </select>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Dictation Result -->
+            <div class="dictation-result" x-show="dictationText || isRecording">
+                <div class="dictation-result-header">
+                    <h3>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                            <polyline points="14 2 14 8 20 8"/>
+                        </svg>
+                        Transcription
+                        <span class="live-badge" x-show="isRecording">EN DIRECT</span>
+                    </h3>
+                    <div class="dictation-actions-mini">
+                        <button class="icon-btn" @click="copyDictation()" title="Copier" :disabled="!dictationText">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                            </svg>
+                        </button>
+                        <button class="icon-btn" @click="clearDictation()" title="Effacer" :disabled="!dictationText">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <polyline points="3 6 5 6 21 6"/>
+                                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+                <div class="dictation-text-area">
+                    <p>
+                        <span x-text="dictationText"></span>
+                        <span class="typing-indicator" x-show="dictationProcessing">
+                            <span></span><span></span><span></span>
+                        </span>
+                    </p>
+                    <p class="dictation-placeholder" x-show="!dictationText && isRecording">
+                        Parlez, la transcription apparaîtra ici...
+                    </p>
+                </div>
+            </div>
+            
+            <!-- Dictation Error -->
+            <div class="error-message" x-show="dictationError" x-transition>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="10"/>
+                    <line x1="12" y1="8" x2="12" y2="12"/>
+                    <line x1="12" y1="16" x2="12.01" y2="16"/>
+                </svg>
+                <span x-text="dictationError"></span>
+                <button @click="dictationError = null" class="error-close">×</button>
+            </div>
+            
+        </div><!-- End Dictation Tab Content -->
+        
+        <!-- Settings Tab Content -->
+        <div class="tab-content" x-show="activeTab === 'settings'" x-transition>
+            
+            <div class="settings-section">
+                <h3 class="settings-title">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="3"/>
+                        <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+                    </svg>
+                    Configuration Ollama
+                </h3>
+                
+                <div class="settings-group">
+                    <label class="settings-label">URL de l'instance Ollama</label>
+                    <div class="settings-input-row">
+                        <input type="text" 
+                               x-model="ollamaSettings.url" 
+                               class="settings-input"
+                               placeholder="http://localhost:11434">
+                        <button class="settings-btn" @click="testOllamaConnection()" :disabled="ollamaLoading">
+                            <span x-show="!ollamaLoading">Tester</span>
+                            <span x-show="ollamaLoading" class="spinner-small"></span>
+                        </button>
+                    </div>
+                    <div class="settings-status" x-show="ollamaStatus">
+                        <span :class="ollamaConnected ? 'status-success' : 'status-error'" x-text="ollamaStatus"></span>
+                    </div>
+                </div>
+                
+                <div class="settings-group">
+                    <label class="settings-label">Modèle LLM</label>
+                    <select x-model="ollamaSettings.model" class="select-input" :disabled="!ollamaConnected">
+                        <option value="">-- Sélectionner un modèle --</option>
+                        <template x-for="model in ollamaModels" :key="model">
+                            <option :value="model" x-text="model"></option>
+                        </template>
+                    </select>
+                </div>
+            </div>
+            
+            <div class="settings-section">
+                <h3 class="settings-title">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+                    </svg>
+                    Prompts de retraitement
+                </h3>
+                
+                <div class="prompts-list">
+                    <template x-for="(prompt, index) in customPrompts" :key="index">
+                        <div class="prompt-item">
+                            <div class="prompt-header">
+                                <input type="text" 
+                                       x-model="prompt.name" 
+                                       class="prompt-name-input"
+                                       placeholder="Nom du prompt">
+                                <button class="icon-btn danger" @click="removePrompt(index)" title="Supprimer">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <polyline points="3 6 5 6 21 6"/>
+                                        <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
+                                    </svg>
+                                </button>
+                            </div>
+                            <textarea x-model="prompt.content" 
+                                      class="prompt-textarea"
+                                      placeholder="Entrez votre prompt ici... Utilisez {text} pour insérer la transcription."
+                                      rows="3"></textarea>
+                        </div>
+                    </template>
+                </div>
+                
+                <button class="add-prompt-btn" @click="addPrompt()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="12" y1="5" x2="12" y2="19"/>
+                        <line x1="5" y1="12" x2="19" y2="12"/>
+                    </svg>
+                    Ajouter un prompt
+                </button>
+                
+                <button class="save-settings-btn" @click="saveSettings()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
+                        <polyline points="17 21 17 13 7 13 7 21"/>
+                        <polyline points="7 3 7 8 15 8"/>
+                    </svg>
+                    Sauvegarder les paramètres
+                </button>
+            </div>
+            
+        </div><!-- End Settings Tab Content -->
+        
+        <!-- Footer -->
+        <footer class="footer">
+            <p>Propulsé par <strong>Faster Whisper Large v3</strong> + <strong>Pyannote</strong></p>
+        </footer>
+    </main>
+    
+    <script src="/static/app.js?v=5"></script>
+</body>
+</html>

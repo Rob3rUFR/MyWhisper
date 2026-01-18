@@ -1,0 +1,36 @@
+services:
+  whisper-stt:
+    build: .
+    container_name: whisper-stt
+    
+    ports:
+      - "8000:8000"
+    
+    volumes:
+      - ./uploads:/app/uploads
+      - ./outputs:/app/outputs
+      - ./models:/app/models
+    
+    environment:
+      - WHISPER_MODEL=${WHISPER_MODEL:-large-v3}
+      - DEVICE=${DEVICE:-cuda}
+      - COMPUTE_TYPE=${COMPUTE_TYPE:-float16}
+      - HF_TOKEN=${HF_TOKEN}
+      - ENABLE_DIARIZATION=${ENABLE_DIARIZATION:-true}
+      - MAX_FILE_SIZE=${MAX_FILE_SIZE:-524288000}
+      # PyTorch 2.6+ compatibility for loading older model checkpoints
+      - TORCH_FORCE_WEIGHTS_ONLY_LOAD=0
+    
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    
+    restart: unless-stopped
+
+networks:
+  default:
+    name: whisper-network
