@@ -1,21 +1,42 @@
 # 🎤 MyWhisper - Transcription Audio avec IA
 
-Conteneur Docker plug-and-play pour la transcription audio utilisant **Faster Whisper Large v3** avec diarisation des speakers via **Pyannote**.
+Conteneur Docker plug-and-play pour la transcription audio utilisant **Faster Whisper Large v3** avec diarisation des speakers via **Pyannote** et post-traitement via **Ollama**.
 
 ![Python](https://img.shields.io/badge/Python-3.11-blue)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.110-green)
 ![Docker](https://img.shields.io/badge/Docker-Ready-blue)
-![CUDA](https://img.shields.io/badge/CUDA-12.1-76B900)
+![CUDA](https://img.shields.io/badge/CUDA-12.4-76B900)
 
 ## ✨ Fonctionnalités
 
-- ✅ **Faster Whisper Large v3** - Transcription rapide et précise
-- ✅ **Diarisation speakers** - Identification des intervenants (pyannote)
-- ✅ **Multi-langue** - Détection automatique ou sélection manuelle
-- ✅ **Export multi-format** - JSON, TXT, SRT, VTT
-- ✅ **API OpenAI-compatible** - Intégration directe avec Open WebUI
-- ✅ **Interface web** - Drag & drop moderne
-- ✅ **GPU acceleration** - Optimisé pour RTX 3090
+### Transcription
+- 🎯 **Faster Whisper Large v3** - Transcription rapide et précise
+- 👥 **Diarisation speakers** - Identification automatique des intervenants (pyannote 3.1)
+- 🌍 **Multi-langue** - Détection automatique ou sélection manuelle (50+ langues)
+- 📄 **Export multi-format** - JSON, TXT, SRT, VTT
+- ✏️ **Renommage speakers** - Personnaliser les noms des intervenants après transcription
+
+### Dictée en temps réel
+- 🎙️ **Enregistrement micro** - Dictée vocale directement depuis le navigateur
+- ⚡ **Transcription live** - Résultats en temps réel pendant l'enregistrement
+- 🔇 **Détection silence** - Arrêt automatique après 10s de silence
+- 📊 **VU-mètre** - Indicateur visuel du niveau audio
+
+### Post-traitement IA (Ollama)
+- 🤖 **Intégration Ollama** - Connexion à votre instance Ollama locale
+- 📝 **Prompts personnalisés** - Créez vos propres prompts de reformulation
+- 📋 **Copie formatée** - Export optimisé pour Word/Outlook avec mise en forme
+
+### Interface & UX
+- 🖥️ **Interface web moderne** - Drag & drop, dark mode
+- 📈 **Progression détaillée** - Suivi en temps réel de chaque étape
+- 💾 **Sauvegarde automatique** - Export direct vers un dossier de votre choix
+- 🔌 **API OpenAI-compatible** - Intégration directe avec Open WebUI
+
+### Performance
+- 🚀 **GPU acceleration** - Optimisé CUDA avec TF32
+- 💪 **Support RTX 5090** - Compatible avec les derniers GPU NVIDIA
+- ⚡ **VAD intégré** - Filtrage automatique des silences
 
 ## 🚀 Quick Start
 
@@ -23,15 +44,16 @@ Conteneur Docker plug-and-play pour la transcription audio utilisant **Faster Wh
 
 - Docker Desktop avec WSL2
 - NVIDIA Container Toolkit ([Installation guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html))
-- GPU CUDA-compatible
+- GPU CUDA-compatible (RTX 3000/4000/5000 series)
 - Token Hugging Face (pour la diarisation)
+- (Optionnel) Ollama pour le post-traitement LLM
 
 ### Installation
 
 ```bash
 # 1. Cloner le repo
-git clone <repo_url>
-cd whisper-stt
+git clone https://github.com/VOTRE_USERNAME/MyWhisper.git
+cd MyWhisper
 
 # 2. Configuration
 copy env.example .env
@@ -50,19 +72,36 @@ docker-compose up -d
 1. Créer un compte sur [huggingface.co](https://huggingface.co)
 2. Aller dans Settings > Access Tokens
 3. Créer un token avec accès en lecture
-4. **Important**: Accepter les conditions d'utilisation de [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
+4. **Important**: Accepter les conditions d'utilisation de :
+   - [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
+   - [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
 5. Ajouter le token dans votre fichier `.env`
 
 ## 📖 Utilisation
 
 ### Interface Web
 
-Accéder à `http://localhost:8000` pour l'interface drag & drop.
+Accéder à `http://localhost:8000` pour l'interface complète.
 
-1. Glisser-déposer un fichier audio
+#### Onglet Fichier
+1. Glisser-déposer un fichier audio/vidéo
 2. Sélectionner les options (langue, format, diarisation)
-3. Cliquer sur "Transcrire"
-4. Télécharger ou copier le résultat
+3. Activer la sauvegarde automatique si souhaité
+4. Cliquer sur "Transcrire"
+5. Renommer les speakers si nécessaire
+6. Retraiter avec l'IA (Ollama) si configuré
+
+#### Onglet Dictée
+1. Sélectionner la langue
+2. Cliquer sur "Démarrer"
+3. Parler dans le micro
+4. La transcription apparaît en temps réel
+5. Arrêt automatique après 10s de silence ou clic sur "Arrêter"
+
+#### Onglet Paramètres
+1. Configurer l'URL Ollama (ex: `http://localhost:11434`)
+2. Sélectionner un modèle LLM
+3. Créer des prompts personnalisés avec `{text}` comme placeholder
 
 ### API REST
 
@@ -73,7 +112,9 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions \
   -F "file=@audio.mp3" \
   -F "language=fr" \
   -F "response_format=json" \
-  -F "diarize=true"
+  -F "diarize=true" \
+  -F "min_speakers=2" \
+  -F "max_speakers=4"
 ```
 
 #### Réponse JSON
@@ -95,7 +136,7 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions \
 }
 ```
 
-#### Autres endpoints
+#### Endpoints disponibles
 
 | Endpoint | Description |
 |----------|-------------|
@@ -103,6 +144,7 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions \
 | `GET /health` | Health check (status GPU, modèles) |
 | `GET /v1/models` | Liste des modèles disponibles |
 | `POST /v1/audio/transcriptions` | Transcription OpenAI-compatible |
+| `POST /v1/audio/transcriptions/stream` | Transcription temps réel (dictée) |
 | `POST /transcribe` | Endpoint simplifié |
 
 ## ⚙️ Configuration Open WebUI
@@ -142,16 +184,17 @@ networks:
 | `HF_TOKEN` | - | Token Hugging Face (requis pour diarisation) |
 | `ENABLE_DIARIZATION` | `true` | Activer la diarisation |
 | `MAX_FILE_SIZE` | `524288000` | Taille max fichier (500MB) |
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | URL de l'instance Ollama |
 
 ### Optimisation GPU
 
-Pour RTX 3090 (configuration optimale) :
+Pour RTX 4090/5090 (configuration optimale) :
 ```env
 DEVICE=cuda
 COMPUTE_TYPE=float16
 ```
 
-Pour GPU avec moins de VRAM :
+Pour GPU avec moins de VRAM (8-12GB) :
 ```env
 COMPUTE_TYPE=int8
 ```
@@ -159,30 +202,33 @@ COMPUTE_TYPE=int8
 ## 📁 Structure du projet
 
 ```
-whisper-stt/
+MyWhisper/
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
 ├── env.example
 ├── .dockerignore
+├── .gitignore
 ├── README.md
+├── PRD_Whisper_STT_Docker.md
 │
 ├── app/
 │   ├── __init__.py
 │   ├── main.py              # FastAPI app + routes
-│   ├── transcription.py     # Core STT logic
-│   ├── diarization.py       # Speaker diarization
-│   ├── utils.py             # Helpers
-│   ├── config.py            # Configuration
+│   ├── transcription.py     # Core STT logic (Faster Whisper)
+│   ├── diarization.py       # Speaker diarization (Pyannote)
+│   ├── patches.py           # Compatibility patches (PyTorch, torchaudio)
+│   ├── utils.py             # Helpers (formats, validation)
+│   ├── config.py            # Configuration (Pydantic)
 │   │
 │   └── static/
-│       ├── index.html       # Interface web
-│       ├── styles.css       # Styles
+│       ├── index.html       # Interface web (3 onglets)
+│       ├── styles.css       # Dark theme moderne
 │       └── app.js           # Alpine.js app
 │
 ├── uploads/                 # Fichiers temporaires (volume)
 ├── outputs/                 # Exports (volume)
-└── models/                  # Modèles téléchargés (volume)
+└── models/                  # Modèles téléchargés (volume, gitignore)
 ```
 
 ## 🐛 Troubleshooting
@@ -191,7 +237,7 @@ whisper-stt/
 
 ```bash
 # Vérifier NVIDIA Container Toolkit
-docker run --rm --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
+docker run --rm --gpus all nvidia/cuda:12.4.1-runtime-ubuntu22.04 nvidia-smi
 ```
 
 ### Erreur CUDA out of memory
@@ -204,8 +250,16 @@ COMPUTE_TYPE=int8
 ### Diarisation échoue
 
 1. Vérifier que `HF_TOKEN` est défini dans `.env`
-2. Accepter les conditions sur [Hugging Face](https://huggingface.co/pyannote/speaker-diarization-3.1)
+2. Accepter les conditions sur Hugging Face (voir installation)
 3. Vérifier les logs : `docker-compose logs -f`
+
+### Erreur "weights_only" PyTorch
+
+Le patch est automatiquement appliqué. Si problème, ajouter dans `docker-compose.yml` :
+```yaml
+environment:
+  - TORCH_FORCE_WEIGHTS_ONLY_LOAD=0
+```
 
 ### Port 8000 déjà utilisé
 
@@ -215,16 +269,24 @@ ports:
   - "8001:8000"
 ```
 
+### Ollama non connecté
+
+1. Vérifier qu'Ollama est lancé : `ollama serve`
+2. Pour Docker, utiliser `host.docker.internal:11434` au lieu de `localhost`
+3. Ou ajouter Ollama au même réseau Docker
+
 ## 📊 Performance
 
-**Hardware cible** : RTX 3090 (24GB VRAM)
+**Hardware testé** : RTX 5090
 
 | Métrique | Valeur |
 |----------|--------|
-| Chargement modèle | < 10s |
+| Chargement modèle | ~5s |
 | Transcription 1min audio | < 5s |
-| VRAM usage | < 6GB |
-| Diarisation overhead | +30% temps max |
+| Transcription 1h audio | ~8min |
+| VRAM usage (transcription) | ~4GB |
+| VRAM usage (+ diarisation) | ~6GB |
+| Diarisation overhead | +30-50% temps |
 
 ## 🔄 Commandes utiles
 
@@ -241,6 +303,9 @@ docker-compose logs -f
 # Arrêter
 docker-compose down
 
+# Reconstruire et relancer
+docker-compose up -d --build
+
 # Vérifier GPU dans le conteneur
 docker exec whisper-stt nvidia-smi
 
@@ -251,6 +316,21 @@ docker exec -it whisper-stt bash
 docker exec whisper-stt rm -rf /app/models/*
 docker-compose restart
 ```
+
+## 🆕 Changelog
+
+### v1.0.0
+- ✅ Transcription Faster Whisper Large v3
+- ✅ Diarisation Pyannote 3.1
+- ✅ Interface web moderne (Alpine.js)
+- ✅ API OpenAI-compatible
+- ✅ Dictée en temps réel avec détection silence
+- ✅ Intégration Ollama pour post-traitement LLM
+- ✅ Renommage des speakers
+- ✅ Sauvegarde automatique (File System Access API)
+- ✅ Export formaté Word/Outlook
+- ✅ Support RTX 5090 (CUDA 12.4, PyTorch 2.9)
+- ✅ Optimisations TF32 et cuDNN
 
 ## 📜 Licence
 
