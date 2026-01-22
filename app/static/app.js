@@ -273,10 +273,12 @@ function sttApp() {
         },
         
         /**
-         * Upload file with XMLHttpRequest for real progress tracking
+         * Upload file with SSE streaming to prevent 504 timeout errors.
+         * Uses the streaming endpoint that sends progress updates.
          */
         uploadWithProgress(formData) {
             return new Promise((resolve, reject) => {
+                // First upload the file with XHR to track upload progress
                 const xhr = new XMLHttpRequest();
                 
                 // Track upload progress (0-25%)
@@ -288,17 +290,60 @@ function sttApp() {
                     }
                 });
                 
-                // Upload complete, start processing phase
-                xhr.upload.addEventListener('load', () => {
-                    this.progress = 25;
-                    this.startProcessingProgress();
-                });
+                // Handle SSE response for processing progress
+                xhr.onreadystatechange = () => {
+                    if (xhr.readyState === XMLHttpRequest.HEADERS_RECEIVED) {
+                        const contentType = xhr.getResponseHeader('content-type');
+                        
+                        if (contentType && contentType.includes('text/event-stream')) {
+                            // SSE streaming response - process events as they arrive
+                            this.progress = 25;
+                            this.statusText = '🔄 Traitement en cours...';
+                        }
+                    }
+                    
+                    if (xhr.readyState === XMLHttpRequest.LOADING) {
+                        const contentType = xhr.getResponseHeader('content-type');
+                        if (contentType && contentType.includes('text/event-stream')) {
+                            // Parse SSE events from partial response
+                            this.processSSEChunk(xhr.responseText);
+                        }
+                    }
+                };
                 
                 xhr.addEventListener('load', () => {
-                    if (xhr.status >= 200 && xhr.status < 300) {
-                        // Create a Response-like object
+                    const contentType = xhr.getResponseHeader('content-type');
+                    
+                    if (contentType && contentType.includes('text/event-stream')) {
+                        // Process final SSE result
+                        const result = this.extractSSEResult(xhr.responseText);
+                        
+                        if (result.error) {
+                            reject(new Error(result.error));
+                        } else if (result.cancelled) {
+                            reject(new Error('Traitement annulé'));
+                        } else if (result.content !== undefined) {
+                            // Create Response-like object
+                            const headers = new Headers();
+                            headers.set('content-type', result.format === 'json' ? 'application/json' : 'text/plain');
+                            
+                            resolve({
+                                ok: true,
+                                status: 200,
+                                headers: headers,
+                                json: () => Promise.resolve(
+                                    typeof result.content === 'string' ? JSON.parse(result.content) : result.content
+                                ),
+                                text: () => Promise.resolve(
+                                    typeof result.content === 'string' ? result.content : JSON.stringify(result.content)
+                                )
+                            });
+                        } else {
+                            reject(new Error('Réponse invalide du serveur'));
+                        }
+                    } else if (xhr.status >= 200 && xhr.status < 300) {
+                        // Standard JSON response (fallback)
                         const headers = new Headers();
-                        const contentType = xhr.getResponseHeader('content-type');
                         if (contentType) headers.set('content-type', contentType);
                         
                         resolve({
@@ -309,8 +354,20 @@ function sttApp() {
                             text: () => Promise.resolve(xhr.responseText)
                         });
                     } else if (xhr.status === 499) {
-                        // Cancelled by user
                         reject(new Error('Traitement annulé'));
+                    } else if (xhr.status === 503) {
+                        // Server busy - try to parse error from SSE or JSON
+                        try {
+                            if (contentType && contentType.includes('text/event-stream')) {
+                                const result = this.extractSSEResult(xhr.responseText);
+                                reject(new Error(result.error || 'Le serveur est occupé'));
+                            } else {
+                                const errorData = JSON.parse(xhr.responseText);
+                                reject(new Error(errorData.detail || 'Le serveur est occupé'));
+                            }
+                        } catch {
+                            reject(new Error('Le serveur est occupé par un autre traitement'));
+                        }
                     } else {
                         try {
                             const errorData = JSON.parse(xhr.responseText);
@@ -324,9 +381,128 @@ function sttApp() {
                 xhr.addEventListener('error', () => reject(new Error('Erreur réseau')));
                 xhr.addEventListener('abort', () => reject(new Error('Requête annulée')));
                 
-                xhr.open('POST', '/v1/audio/transcriptions');
+                // Use streaming endpoint to prevent 504 timeout
+                xhr.open('POST', '/v1/audio/transcriptions/stream');
                 xhr.send(formData);
             });
+        },
+        
+        /**
+         * Process SSE chunk and update progress
+         */
+        processSSEChunk(text) {
+            const lines = text.split('\n');
+            let currentEvent = null;
+            let currentData = '';
+            
+            for (const line of lines) {
+                if (line.startsWith('event: ')) {
+                    currentEvent = line.substring(7).trim();
+                } else if (line.startsWith('data: ')) {
+                    currentData = line.substring(6);
+                    
+                    if (currentEvent === 'progress' && currentData) {
+                        try {
+                            const progress = JSON.parse(currentData);
+                            this.updateProgressFromSSE(progress);
+                        } catch (e) {
+                            console.debug('Failed to parse progress:', e);
+                        }
+                    }
+                    
+                    currentEvent = null;
+                    currentData = '';
+                }
+            }
+        },
+        
+        /**
+         * Update progress from SSE event
+         */
+        updateProgressFromSSE(progress) {
+            if (progress.percent !== undefined) {
+                this.progress = progress.percent;
+                this.useServerProgress = true;
+            }
+            
+            const step = progress.step;
+            switch (step) {
+                case 'transcribing':
+                    if (progress.audio_duration > 0) {
+                        const mins = Math.floor(progress.audio_duration / 60);
+                        const secs = Math.round(progress.audio_duration % 60);
+                        this.statusText = mins > 0 
+                            ? `🎤 Transcription en cours... (${mins}m${secs}s d'audio)`
+                            : `🎤 Transcription en cours... (${secs}s d'audio)`;
+                    } else {
+                        this.statusText = '🎤 Transcription en cours...';
+                    }
+                    break;
+                case 'diarizing_loading':
+                    this.statusText = '👥 Chargement du modèle de diarisation...';
+                    break;
+                case 'diarizing_processing':
+                    const subProgress = progress.percent >= 40 ? Math.round(((progress.percent - 40) / 45) * 100) : 0;
+                    this.statusText = `👥 Analyse des voix... ${Math.min(subProgress, 100)}%`;
+                    break;
+                case 'diarizing_chunk':
+                    if (progress.total_chunks > 0) {
+                        this.statusText = `👥 Diarisation: segment ${progress.current_chunk}/${progress.total_chunks}`;
+                    } else {
+                        this.statusText = '👥 Analyse des locuteurs...';
+                    }
+                    break;
+                case 'diarizing_merging':
+                    this.statusText = '👥 Harmonisation des locuteurs...';
+                    break;
+                case 'merging':
+                    this.statusText = '🔗 Fusion transcription et locuteurs...';
+                    break;
+                case 'finalizing':
+                    this.statusText = '📝 Finalisation...';
+                    break;
+                case 'complete':
+                    this.statusText = '✅ Terminé !';
+                    break;
+            }
+        },
+        
+        /**
+         * Extract final result from SSE response
+         */
+        extractSSEResult(text) {
+            const lines = text.split('\n');
+            let result = {};
+            let currentEvent = null;
+            
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                
+                if (line.startsWith('event: ')) {
+                    currentEvent = line.substring(7).trim();
+                } else if (line.startsWith('data: ') && currentEvent) {
+                    const data = line.substring(6);
+                    
+                    try {
+                        const parsed = JSON.parse(data);
+                        
+                        if (currentEvent === 'result') {
+                            result.content = parsed.content;
+                            result.format = parsed.format;
+                        } else if (currentEvent === 'error') {
+                            result.error = parsed.detail || 'Erreur inconnue';
+                        } else if (currentEvent === 'cancelled') {
+                            result.cancelled = true;
+                        }
+                    } catch (e) {
+                        console.debug('Failed to parse SSE data:', e);
+                    }
+                    
+                    currentEvent = null;
+                }
+            }
+            
+            return result;
         },
         
         /**

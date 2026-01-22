@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
-from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -332,6 +332,308 @@ async def simple_transcribe(
     return await _process_transcription(file, language, "json", diarize, min_speakers, max_speakers)
 
 
+@app.post("/v1/audio/transcriptions/stream")
+async def transcribe_audio_stream(
+    file: UploadFile = File(...),
+    model: str = Form("whisper-large-v3"),
+    language: Optional[str] = Form(None),
+    response_format: str = Form("json"),
+    diarize: bool = Form(False),
+    min_speakers: Optional[int] = Form(None),
+    max_speakers: Optional[int] = Form(None),
+    processing_type: str = Form("file")
+):
+    """
+    SSE streaming transcription endpoint that prevents 504 timeout errors.
+    
+    Sends periodic progress updates to keep the connection alive,
+    then sends the final result when processing completes.
+    
+    SSE Events:
+        - progress: {step, percent, message}
+        - result: Final transcription result
+        - error: Error message if processing fails
+    """
+    return await _process_transcription_stream(
+        file, language, response_format, diarize, 
+        min_speakers, max_speakers, processing_type
+    )
+
+
+async def _process_transcription_stream(
+    file: UploadFile,
+    language: Optional[str],
+    response_format: str,
+    diarize: bool,
+    min_speakers: Optional[int] = None,
+    max_speakers: Optional[int] = None,
+    processing_type: str = "file"
+):
+    """
+    Process transcription with SSE streaming to prevent proxy timeouts.
+    Sends progress updates every few seconds to keep connection alive.
+    """
+    import asyncio
+    from queue import Queue
+    from threading import Thread
+    
+    # Check if already processing
+    if processing_state.is_processing:
+        status = processing_state.get_status()
+        error_msg = (
+            f"Un traitement est déjà en cours"
+            f" ({status['processing_type']}: {status['current_file']}). "
+            f"Veuillez attendre la fin de l'opération."
+        )
+        
+        async def error_stream():
+            yield f"event: error\ndata: {json.dumps({'detail': error_msg})}\n\n"
+        
+        return StreamingResponse(
+            error_stream(),
+            media_type="text/event-stream",
+            status_code=503
+        )
+    
+    # Read file content before starting the stream
+    file_content = await file.read()
+    file_size = len(file_content)
+    filename = file.filename
+    
+    # Validate file
+    is_valid, error = validate_audio_file(filename, file_size, settings.MAX_FILE_SIZE)
+    if not is_valid:
+        async def validation_error():
+            yield f"event: error\ndata: {json.dumps({'detail': error})}\n\n"
+        return StreamingResponse(
+            validation_error(),
+            media_type="text/event-stream",
+            status_code=400
+        )
+    
+    # Queue for communication between processing thread and SSE stream
+    result_queue = Queue()
+    
+    def run_transcription():
+        """Run transcription in a separate thread"""
+        temp_path = None
+        processing_start_time = time.time()
+        
+        try:
+            # Mark processing as started
+            processing_state.start(filename, processing_type)
+            
+            # Save to temp file
+            safe_filename = sanitize_filename(filename)
+            temp_path = Path(settings.UPLOAD_DIR) / f"{uuid.uuid4()}_{safe_filename}"
+            
+            with open(temp_path, 'wb') as f:
+                f.write(file_content)
+            
+            logger.info(f"Processing file (stream): {filename} ({file_size / 1024 / 1024:.1f}MB)")
+            
+            # Check for cancellation
+            if processing_state.cancel_requested:
+                result_queue.put(("cancelled", "Traitement annulé par l'utilisateur"))
+                return
+            
+            processing_state.update_progress("transcribing", percent=5)
+            
+            # Transcribe
+            result = transcriber.transcribe(
+                str(temp_path),
+                language=language,
+                vad_filter=True
+            )
+            
+            audio_duration = result.get("duration", 0)
+            processing_state.update_progress(
+                "transcribing", 
+                percent=30 if diarize else 90,
+                audio_duration=audio_duration
+            )
+            
+            if processing_state.cancel_requested:
+                result_queue.put(("cancelled", "Traitement annulé par l'utilisateur"))
+                return
+            
+            # Diarization if requested
+            if diarize:
+                if diarizer.is_available:
+                    logger.info("Running speaker diarization (stream)...")
+                    processing_state.update_progress("diarizing_loading", percent=32)
+                    
+                    _min = min_speakers if min_speakers else (settings.DIARIZATION_MIN_SPEAKERS or None)
+                    _max = max_speakers if max_speakers else (settings.DIARIZATION_MAX_SPEAKERS or None)
+                    
+                    def on_diarization_progress(step: str, current: int = 0, total: int = 1, sub_percent: float = 0.0):
+                        base_percent = 35
+                        if step == "loading":
+                            percent = base_percent + int(sub_percent * 5)
+                        elif step == "processing":
+                            percent = 40 + int(sub_percent * 45)
+                        elif step == "chunk":
+                            chunk_progress = (current / total) if total > 0 else 0
+                            percent = 40 + int(chunk_progress * 45)
+                        elif step == "merging":
+                            percent = 85 + int(sub_percent * 3)
+                        else:
+                            percent = base_percent
+                        
+                        processing_state.update_progress(
+                            f"diarizing_{step}",
+                            percent=min(percent, 88),
+                            current_chunk=current,
+                            total_chunks=total
+                        )
+                    
+                    timeline = diarizer.diarize(
+                        str(temp_path),
+                        min_speakers=_min,
+                        max_speakers=_max,
+                        progress_callback=on_diarization_progress
+                    )
+                    
+                    if processing_state.cancel_requested:
+                        result_queue.put(("cancelled", "Traitement annulé par l'utilisateur"))
+                        return
+                    
+                    processing_state.update_progress("merging", percent=90)
+                    
+                    result["segments"] = diarizer.merge_with_transcription(
+                        result["segments"],
+                        timeline
+                    )
+                    
+                    result["text"] = segments_to_text(
+                        result["segments"],
+                        include_speakers=True
+                    )
+                else:
+                    logger.warning("Diarization requested but not available")
+            
+            processing_state.update_progress("finalizing", percent=95)
+            
+            # Format response
+            if response_format == "text":
+                result_content = result["text"]
+            elif response_format == "srt":
+                result_content = segments_to_srt(result["segments"])
+            elif response_format == "vtt":
+                result_content = segments_to_vtt(result["segments"])
+            else:
+                result_content = result
+            
+            # Save to history
+            if processing_type == "file":
+                try:
+                    speakers_count = 0
+                    if diarize and result.get("segments"):
+                        speakers = set(s.get("speaker") for s in result["segments"] if s.get("speaker"))
+                        speakers_count = len(speakers)
+                    
+                    processing_duration = round(time.time() - processing_start_time, 2)
+                    
+                    history.save_transcription(
+                        filename=filename,
+                        file_size=file_size,
+                        audio_duration=result.get("duration", 0),
+                        language=result.get("language", "unknown"),
+                        format=response_format,
+                        diarization=diarize,
+                        speakers_count=speakers_count,
+                        segments_count=len(result.get("segments", [])),
+                        result_text=result_content if isinstance(result_content, str) else json.dumps(result_content, ensure_ascii=False, indent=2),
+                        result_json=result,
+                        processing_duration=processing_duration
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to save to history: {e}")
+            
+            result_queue.put(("success", result_content, response_format))
+            
+        except Exception as e:
+            logger.error(f"Transcription error (stream): {e}")
+            result_queue.put(("error", str(e)))
+        finally:
+            processing_state.stop()
+            if temp_path and temp_path.exists():
+                try:
+                    os.remove(temp_path)
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup temp file: {e}")
+    
+    async def event_stream():
+        """Generate SSE events with progress updates"""
+        # Start transcription in background thread
+        thread = Thread(target=run_transcription)
+        thread.start()
+        
+        last_status = None
+        
+        # Send progress updates while processing
+        while thread.is_alive():
+            # Check for result
+            if not result_queue.empty():
+                break
+            
+            # Get current status
+            status = processing_state.get_status()
+            
+            # Send progress update (only if changed)
+            progress_data = {
+                "step": status["current_step"],
+                "percent": status["progress_percent"],
+                "audio_duration": status["audio_duration"],
+                "current_chunk": status["current_chunk"],
+                "total_chunks": status["total_chunks"]
+            }
+            
+            if progress_data != last_status:
+                yield f"event: progress\ndata: {json.dumps(progress_data)}\n\n"
+                last_status = progress_data
+            
+            # Wait before next update (keeps connection alive)
+            await asyncio.sleep(1)
+        
+        # Wait for thread to complete
+        thread.join(timeout=5)
+        
+        # Get final result
+        if not result_queue.empty():
+            result = result_queue.get()
+            
+            if result[0] == "success":
+                result_content = result[1]
+                fmt = result[2]
+                
+                # Send final progress
+                yield f"event: progress\ndata: {json.dumps({'step': 'complete', 'percent': 100})}\n\n"
+                
+                # Send result based on format
+                if isinstance(result_content, str):
+                    yield f"event: result\ndata: {json.dumps({'format': fmt, 'content': result_content})}\n\n"
+                else:
+                    yield f"event: result\ndata: {json.dumps({'format': fmt, 'content': result_content})}\n\n"
+                    
+            elif result[0] == "cancelled":
+                yield f"event: cancelled\ndata: {json.dumps({'message': result[1]})}\n\n"
+            else:
+                yield f"event: error\ndata: {json.dumps({'detail': result[1]})}\n\n"
+        else:
+            yield f"event: error\ndata: {json.dumps({'detail': 'Processing failed unexpectedly'})}\n\n"
+    
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"  # Disable nginx buffering
+        }
+    )
+
+
 async def _process_transcription(
     file: UploadFile,
     language: Optional[str],
@@ -344,17 +646,17 @@ async def _process_transcription(
     """
     Process transcription request.
     
+    Uses asyncio.to_thread() to run Whisper in a separate thread,
+    keeping the server responsive during transcription.
+    
     1. Check if another transcription is in progress
     2. Validate file (format, size)
     3. Save temporarily in /uploads
-    4. Run Whisper transcription
-    5. Run diarization if requested
+    4. Run Whisper transcription (in thread)
+    5. Run diarization if requested (in thread)
     6. Format response
     7. Cleanup temporary file
     """
-    temp_path = None
-    processing_start_time = time.time()  # Track processing duration
-    
     # Try to acquire the lock without blocking to check status
     if processing_state.is_processing:
         status = processing_state.get_status()
@@ -366,55 +668,59 @@ async def _process_transcription(
         logger.warning(f"Rejected request: {error_msg}")
         raise HTTPException(status_code=503, detail=error_msg)
     
+    # Validate file first (before acquiring lock)
+    file_content = await file.read()
+    file_size = len(file_content)
+    filename = file.filename
+    
+    is_valid, error = validate_audio_file(filename, file_size, settings.MAX_FILE_SIZE)
+    if not is_valid:
+        raise HTTPException(status_code=400, detail=error)
+    
     # Acquire the lock for processing
     async with processing_state.lock:
-        try:
-            # Double-check after acquiring lock
-            if processing_state.is_processing:
-                status = processing_state.get_status()
-                error_msg = (
-                    f"Un traitement est déjà en cours"
-                    f" ({status['processing_type']}: {status['current_file']}). "
-                    f"Veuillez attendre la fin de l'opération."
-                )
-                raise HTTPException(status_code=503, detail=error_msg)
-            
-            # Validate file
-            file_content = await file.read()
-            file_size = len(file_content)
-            
-            is_valid, error = validate_audio_file(
-                file.filename,
-                file_size,
-                settings.MAX_FILE_SIZE
+        # Double-check after acquiring lock
+        if processing_state.is_processing:
+            status = processing_state.get_status()
+            error_msg = (
+                f"Un traitement est déjà en cours"
+                f" ({status['processing_type']}: {status['current_file']}). "
+                f"Veuillez attendre la fin de l'opération."
             )
-            
-            if not is_valid:
-                raise HTTPException(status_code=400, detail=error)
-            
-            # Mark processing as started
-            processing_state.start(file.filename, processing_type)
-            
+            raise HTTPException(status_code=503, detail=error_msg)
+        
+        # Mark processing as started
+        processing_state.start(filename, processing_type)
+    
+    # Now run the heavy processing in a separate thread
+    # This allows the server to remain responsive
+    def run_blocking_transcription():
+        """
+        Synchronous function that runs in a separate thread.
+        This prevents blocking the asyncio event loop.
+        """
+        temp_path = None
+        processing_start_time = time.time()
+        
+        try:
             # Save to temp file
-            safe_filename = sanitize_filename(file.filename)
+            safe_filename = sanitize_filename(filename)
             temp_path = Path(settings.UPLOAD_DIR) / f"{uuid.uuid4()}_{safe_filename}"
             
-            async with aiofiles.open(temp_path, 'wb') as f:
-                await f.write(file_content)
+            with open(temp_path, 'wb') as f:
+                f.write(file_content)
             
-            logger.info(f"Processing file: {file.filename} ({file_size / 1024 / 1024:.1f}MB)")
+            logger.info(f"Processing file: {filename} ({file_size / 1024 / 1024:.1f}MB)")
             
             # Check for cancellation before transcription
             if processing_state.cancel_requested:
                 logger.info("Processing cancelled before transcription")
-                raise HTTPException(status_code=499, detail="Traitement annulé par l'utilisateur")
+                return {"error": "cancelled", "message": "Traitement annulé par l'utilisateur"}
             
             # Update progress: transcription starting
-            # Progress distribution with diarization: transcription 5-30%, diarization 30-90%, merge 90-95%, finalize 95-100%
-            # Progress distribution without diarization: transcription 5-90%, finalize 90-100%
             processing_state.update_progress("transcribing", percent=5)
             
-            # Transcribe
+            # Transcribe (blocking call)
             result = transcriber.transcribe(
                 str(temp_path),
                 language=language,
@@ -429,10 +735,10 @@ async def _process_transcription(
                 audio_duration=audio_duration
             )
             
-            # Check for cancellation after transcription, before diarization
+            # Check for cancellation after transcription
             if processing_state.cancel_requested:
                 logger.info("Processing cancelled after transcription")
-                raise HTTPException(status_code=499, detail="Traitement annulé par l'utilisateur")
+                return {"error": "cancelled", "message": "Traitement annulé par l'utilisateur"}
             
             # Diarization if requested
             if diarize:
@@ -440,37 +746,19 @@ async def _process_transcription(
                     logger.info("Running speaker diarization...")
                     processing_state.update_progress("diarizing_loading", percent=32)
                     
-                    # Use provided params or fall back to config defaults
                     _min = min_speakers if min_speakers else (settings.DIARIZATION_MIN_SPEAKERS or None)
                     _max = max_speakers if max_speakers else (settings.DIARIZATION_MAX_SPEAKERS or None)
                     
-                    # Progress callback for diarization steps
-                    # Diarization goes from 35% to 88% of total progress
                     def on_diarization_progress(step: str, current: int = 0, total: int = 1, sub_percent: float = 0.0):
-                        """
-                        Enhanced progress callback that handles both chunk-based and sub-step progress.
-                        
-                        Args:
-                            step: Current step name ('loading', 'processing', 'chunk', 'merging')
-                            current: Current item number (e.g., chunk number)
-                            total: Total items (e.g., total chunks)
-                            sub_percent: Sub-progress within current step (0.0 to 1.0)
-                        """
-                        base_percent = 35  # Where diarization starts
-                        range_percent = 53  # Range for diarization (35 to 88)
-                        
+                        base_percent = 35
                         if step == "loading":
-                            # Loading pipeline: 35-40%
                             percent = base_percent + int(sub_percent * 5)
                         elif step == "processing":
-                            # Processing (for short audio): 40-85%
                             percent = 40 + int(sub_percent * 45)
                         elif step == "chunk":
-                            # Chunk-based progress: 40-85%
                             chunk_progress = (current / total) if total > 0 else 0
                             percent = 40 + int(chunk_progress * 45)
                         elif step == "merging":
-                            # Merging speakers: 85-88%
                             percent = 85 + int(sub_percent * 3)
                         else:
                             percent = base_percent
@@ -492,7 +780,7 @@ async def _process_transcription(
                     # Check for cancellation after diarization
                     if processing_state.cancel_requested:
                         logger.info("Processing cancelled after diarization")
-                        raise HTTPException(status_code=499, detail="Traitement annulé par l'utilisateur")
+                        return {"error": "cancelled", "message": "Traitement annulé par l'utilisateur"}
                     
                     # Merge transcription with diarization
                     processing_state.update_progress("merging", percent=90)
@@ -502,7 +790,6 @@ async def _process_transcription(
                         timeline
                     )
                     
-                    # Update full text with speaker labels
                     result["text"] = segments_to_text(
                         result["segments"],
                         include_speakers=True
@@ -521,24 +808,20 @@ async def _process_transcription(
             elif response_format == "vtt":
                 result_content = segments_to_vtt(result["segments"])
             else:
-                # JSON format
                 result_content = result
             
             # Save to history (only for file transcriptions, not dictation)
             if processing_type == "file":
                 try:
-                    # Count speakers if diarization was done
                     speakers_count = 0
                     if diarize and result.get("segments"):
                         speakers = set(s.get("speaker") for s in result["segments"] if s.get("speaker"))
                         speakers_count = len(speakers)
                     
-                    # Calculate processing duration
                     processing_duration = round(time.time() - processing_start_time, 2)
                     
-                    # Save with formatted result
                     history.save_transcription(
-                        filename=file.filename,
+                        filename=filename,
                         file_size=file_size,
                         audio_duration=result.get("duration", 0),
                         language=result.get("language", "unknown"),
@@ -547,37 +830,53 @@ async def _process_transcription(
                         speakers_count=speakers_count,
                         segments_count=len(result.get("segments", [])),
                         result_text=result_content if isinstance(result_content, str) else json.dumps(result_content, ensure_ascii=False, indent=2),
-                        result_json=result,  # Always save full JSON for re-formatting
+                        result_json=result,
                         processing_duration=processing_duration
                     )
                 except Exception as e:
                     logger.warning(f"Failed to save to history: {e}")
             
-            # Return response
-            if response_format == "text":
-                return PlainTextResponse(content=result_content)
-            elif response_format == "srt":
-                return PlainTextResponse(content=result_content, media_type="text/plain")
-            elif response_format == "vtt":
-                return PlainTextResponse(content=result_content, media_type="text/vtt")
-            else:
-                return JSONResponse(content=result_content)
+            return {
+                "success": True,
+                "result": result,
+                "result_content": result_content,
+                "format": response_format
+            }
             
-        except HTTPException:
-            raise
         except Exception as e:
             logger.error(f"Transcription error: {e}")
-            raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
+            return {"error": "exception", "message": str(e)}
         finally:
-            # Mark processing as complete
             processing_state.stop()
-            
-            # Cleanup temp file
             if temp_path and temp_path.exists():
                 try:
                     os.remove(temp_path)
                 except Exception as e:
                     logger.warning(f"Failed to cleanup temp file: {e}")
+    
+    # Run the blocking transcription in a thread pool
+    # This keeps the server responsive during processing
+    result = await asyncio.to_thread(run_blocking_transcription)
+    
+    # Handle the result
+    if "error" in result:
+        if result["error"] == "cancelled":
+            raise HTTPException(status_code=499, detail=result["message"])
+        else:
+            raise HTTPException(status_code=500, detail=f"Transcription failed: {result['message']}")
+    
+    # Return appropriate response based on format
+    result_content = result["result_content"]
+    fmt = result["format"]
+    
+    if fmt == "text":
+        return PlainTextResponse(content=result_content)
+    elif fmt == "srt":
+        return PlainTextResponse(content=result_content, media_type="text/plain")
+    elif fmt == "vtt":
+        return PlainTextResponse(content=result_content, media_type="text/vtt")
+    else:
+        return JSONResponse(content=result_content)
 
 
 # ============================================

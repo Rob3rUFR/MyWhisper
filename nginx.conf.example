@@ -1,0 +1,96 @@
+# ==============================================
+# Configuration NGINX pour MyWhisper
+# ==============================================
+# Ce fichier résout les erreurs 504 Gateway Timeout
+# lors des transcriptions longues.
+#
+# À adapter selon votre configuration.
+# ==============================================
+
+# Exemple de configuration pour un reverse proxy
+server {
+    listen 80;
+    server_name whisper.example.com;
+
+    # Taille max des fichiers (500MB pour gros fichiers audio/vidéo)
+    client_max_body_size 500M;
+    
+    # Buffers pour les gros uploads
+    client_body_buffer_size 128k;
+    
+    location / {
+        proxy_pass http://whisper-stt:8000;
+        proxy_http_version 1.1;
+        
+        # ================================================
+        # TIMEOUTS - Essentiels pour éviter les erreurs 504
+        # ================================================
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 7200s;     # 2 heures
+        proxy_read_timeout 7200s;     # 2 heures
+        
+        # ================================================
+        # Headers standard
+        # ================================================
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # ================================================
+        # SSE / Streaming - Critique pour la progression
+        # ================================================
+        # Désactive le buffering pour Server-Sent Events
+        proxy_buffering off;
+        proxy_cache off;
+        
+        # Headers pour SSE
+        proxy_set_header Connection '';
+        chunked_transfer_encoding off;
+        
+        # Alternative: laisser nginx gérer les chunks
+        # proxy_set_header Connection 'keep-alive';
+    }
+    
+    # Endpoint spécifique pour le streaming (si besoin de config différente)
+    location /v1/audio/transcriptions/stream {
+        proxy_pass http://whisper-stt:8000;
+        proxy_http_version 1.1;
+        
+        # Timeouts longs pour transcription
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 7200s;     # 2 heures
+        proxy_read_timeout 7200s;     # 2 heures
+        
+        # Headers
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # SSE streaming obligatoire
+        proxy_buffering off;
+        proxy_cache off;
+        
+        # Important pour SSE
+        proxy_set_header Connection '';
+        chunked_transfer_encoding off;
+        
+        # Désactive le buffering nginx pour les événements SSE
+        # Ceci permet d'envoyer les événements immédiatement
+        add_header X-Accel-Buffering no;
+    }
+}
+
+# ==============================================
+# Configuration avec SSL (HTTPS)
+# ==============================================
+# server {
+#     listen 443 ssl http2;
+#     server_name whisper.example.com;
+#     
+#     ssl_certificate /etc/nginx/ssl/cert.pem;
+#     ssl_certificate_key /etc/nginx/ssl/key.pem;
+#     
+#     # ... mêmes paramètres que ci-dessus ...
+# }
