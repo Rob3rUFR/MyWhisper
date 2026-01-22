@@ -18,6 +18,9 @@ services:
       - HF_TOKEN=${HF_TOKEN}
       - ENABLE_DIARIZATION=${ENABLE_DIARIZATION:-true}
       - MAX_FILE_SIZE=${MAX_FILE_SIZE:-524288000}
+      # Ollama LLM (use host.docker.internal to reach host machine)
+      - OLLAMA_URL=${OLLAMA_URL}
+      - OLLAMA_MODEL=${OLLAMA_MODEL}
       # PyTorch 2.6+ compatibility for loading older model checkpoints
       - TORCH_FORCE_WEIGHTS_ONLY_LOAD=0
     

@@ -34,6 +34,13 @@ class Settings(BaseSettings):
     OUTPUT_DIR: str = "./outputs"
     MODEL_DIR: str = "./models"
     
+    # Ollama (LLM post-processing)
+    OLLAMA_URL: str = ""  # e.g. http://localhost:11434 or http://ollama:11434
+    OLLAMA_MODEL: str = ""  # e.g. llama3.2, mistral, etc.
+    
+    # History settings
+    HISTORY_RETENTION_DAYS: int = 90  # Default: 90 days
+    
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

@@ -8,13 +8,13 @@ function sttApp() {
         // State
         activeTab: 'file',
         
-        // Ollama settings
+        // Ollama settings (configured via .env on server)
         ollamaSettings: {
-            url: 'http://localhost:11434',
             model: ''
         },
         ollamaModels: [],
         ollamaConnected: false,
+        ollamaConfigured: false,
         ollamaStatus: '',
         ollamaLoading: false,
         llmProcessing: false,
@@ -64,21 +64,43 @@ function sttApp() {
             silenceTimeout: 10  // seconds of silence before auto-stop
         },
         
+        // Processing status (global lock)
+        serverProcessing: {
+            is_processing: false,
+            current_file: null,
+            processing_type: null,
+            elapsed_seconds: null,
+            cancel_requested: false,
+            current_step: 'idle',
+            progress_percent: 0,
+            total_chunks: 0,
+            current_chunk: 0,
+            audio_duration: 0
+        },
+        statusCheckInterval: null,
+        cancelRequested: false,
+        useServerProgress: false,  // Use server-reported progress when available
+        
         // Options
         options: {
             language: '',
-            format: 'json',
+            format: 'text',
             diarize: false,
             minSpeakers: '',
             maxSpeakers: ''
         },
         
-        // Save options
-        saveOptions: {
-            enabled: false,
-            folderHandle: null,
-            folderName: ''
-        },
+        // History state
+        historyItems: [],
+        historyTotal: 0,
+        historyOffset: 0,
+        historyLimit: 20,
+        historyLoading: false,
+        historyViewItem: null,
+        
+        // Settings state
+        retentionDays: 90,
+        retentionLoading: false,
         
         // Language map for display
         languageNames: {
@@ -159,6 +181,13 @@ function sttApp() {
         async startTranscription() {
             if (!this.selectedFile || this.processing) return;
             
+            // Check if server is available
+            await this.checkServerStatus();
+            if (this.serverProcessing.is_processing) {
+                this.showError(this.getBlockingMessage());
+                return;
+            }
+            
             this.processing = true;
             this.progress = 0;
             this.error = null;
@@ -167,6 +196,8 @@ function sttApp() {
             this.llmResult = '';
             this.statusText = 'Préparation...';
             this.progressInterval = null;
+            this.cancelRequested = false;
+            this.useServerProgress = false;
             
             try {
                 // Prepare form data
@@ -223,20 +254,20 @@ function sttApp() {
                 this.progress = 100;
                 this.statusText = '✅ Terminé !';
                 
-                // Auto-save if enabled
-                if (this.saveOptions.enabled && this.result) {
-                    const filename = this.generateSaveFilename();
-                    await this.saveResultToFile(this.result, filename);
-                    this.statusText = '✅ Terminé et sauvegardé !';
-                }
-                
             } catch (err) {
                 console.error('Transcription error:', err);
                 this.stopProgressSimulation();
-                this.showError(err.message || 'Une erreur est survenue');
+                
+                // Don't show error if cancelled
+                if (err.message !== 'Traitement annulé') {
+                    this.showError(err.message || 'Une erreur est survenue');
+                } else {
+                    this.statusText = '⏹️ Traitement annulé';
+                }
             } finally {
                 setTimeout(() => {
                     this.processing = false;
+                    this.cancelRequested = false;
                 }, 500);
             }
         },
@@ -277,6 +308,9 @@ function sttApp() {
                             json: () => Promise.resolve(JSON.parse(xhr.responseText)),
                             text: () => Promise.resolve(xhr.responseText)
                         });
+                    } else if (xhr.status === 499) {
+                        // Cancelled by user
+                        reject(new Error('Traitement annulé'));
                     } else {
                         try {
                             const errorData = JSON.parse(xhr.responseText);
@@ -297,45 +331,121 @@ function sttApp() {
         
         /**
          * Start simulated progress during server processing
+         * Uses asymptotic progression that slows down as it approaches the limit
+         * This provides a more realistic feel for variable-length processing
+         * 
+         * Progress distribution (with diarization):
+         * - 0-5%: Upload complete, starting
+         * - 5-30%: Transcription
+         * - 30-35%: Loading diarization model
+         * - 35-85%: Diarization processing
+         * - 85-90%: Merging
+         * - 90-100%: Finalizing
          */
         startProcessingProgress() {
-            const stages = this.options.diarize ? [
-                { start: 25, end: 40, text: '🔄 Chargement du modèle Whisper...', duration: 3000 },
-                { start: 40, end: 60, text: '🎤 Transcription de l\'audio...', duration: 8000 },
-                { start: 60, end: 80, text: '👥 Analyse des locuteurs...', duration: 10000 },
-                { start: 80, end: 95, text: '📝 Alignement des segments...', duration: 5000 }
-            ] : [
-                { start: 25, end: 50, text: '🔄 Chargement du modèle Whisper...', duration: 3000 },
-                { start: 50, end: 85, text: '🎤 Transcription de l\'audio...', duration: 10000 },
-                { start: 85, end: 95, text: '📝 Formatage du résultat...', duration: 3000 }
+            // Estimate processing time based on file size (rough heuristic)
+            const fileSizeMB = this.selectedFile ? this.selectedFile.size / (1024 * 1024) : 10;
+            // With diarization, processing takes much longer
+            const baseFactor = this.options.diarize ? 8 : 3;
+            const estimatedSeconds = Math.max(15, fileSizeMB * baseFactor);
+            
+            // Messages to display during processing (fallback when server doesn't report)
+            const transcriptionMessages = [
+                '🎤 Analyse de l\'audio...',
+                '🎤 Transcription en cours...',
+                '🎤 Détection de la parole...',
+                '🎤 Conversion audio → texte...',
+                '🎤 Traitement des segments...'
             ];
             
-            let stageIndex = 0;
-            let stageProgress = 0;
+            const diarizationLoadingMessages = [
+                '👥 Chargement du modèle de diarisation...',
+                '👥 Préparation de l\'analyse des voix...'
+            ];
+            
+            const diarizationMessages = [
+                '👥 Analyse des voix...',
+                '👥 Identification des locuteurs...',
+                '👥 Séparation des intervenants...',
+                '👥 Détection des changements de locuteur...',
+                '👥 Attribution des segments...'
+            ];
+            
+            const mergingMessages = [
+                '🔗 Fusion des résultats...',
+                '🔗 Association texte et locuteurs...'
+            ];
+            
+            const finalizationMessages = [
+                '📝 Formatage du résultat...',
+                '📝 Finalisation...',
+                '⏳ Presque terminé...'
+            ];
+            
+            let elapsedTime = 0;
+            let lastMessageChange = 0;
+            let messageIndex = 0;
+            // Max progress depends on whether we're using diarization
+            const maxProgress = this.options.diarize ? 88 : 90;
+            
+            // Asymptotic function with adjusted speed for diarization
+            const k = 2.5 / estimatedSeconds;
             
             this.progressInterval = setInterval(() => {
-                if (stageIndex >= stages.length) {
-                    // Keep at 95% until response arrives
-                    this.progress = 95;
-                    this.statusText = '⏳ Finalisation...';
-                    return;
+                // If server is reporting progress, use that instead of simulation
+                if (this.useServerProgress) {
+                    return; // Server progress is being used, skip simulation
                 }
                 
-                const stage = stages[stageIndex];
-                const stageRange = stage.end - stage.start;
-                const incrementsPerStage = stage.duration / 100;
+                elapsedTime += 0.2; // 200ms intervals
                 
-                stageProgress += (stageRange / (stage.duration / 100));
-                const currentProgress = stage.start + Math.min(stageProgress, stageRange);
+                // Calculate asymptotic progress (25% to maxProgress)
+                const asymptotic = 1 - Math.exp(-k * elapsedTime);
+                const progressRange = maxProgress - 25;
+                let currentProgress = 25 + (progressRange * asymptotic);
+                
+                // Add small random variations for realism (smaller jitter)
+                const jitter = (Math.random() - 0.5) * 0.3;
+                currentProgress = Math.min(maxProgress, currentProgress + jitter);
                 
                 this.progress = Math.round(currentProgress);
-                this.statusText = stage.text;
                 
-                if (currentProgress >= stage.end) {
-                    stageIndex++;
-                    stageProgress = 0;
+                // Change status message periodically (more frequent updates)
+                const shouldChangeMessage = elapsedTime - lastMessageChange > 3 + Math.random() * 2;
+                
+                if (shouldChangeMessage) {
+                    lastMessageChange = elapsedTime;
+                    
+                    // Determine which phase we're in based on progress (aligned with server steps)
+                    if (this.progress < 30) {
+                        // Transcription phase (5-30%)
+                        this.statusText = transcriptionMessages[messageIndex % transcriptionMessages.length];
+                    } else if (this.options.diarize && this.progress < 38) {
+                        // Loading diarization model (30-38%)
+                        this.statusText = diarizationLoadingMessages[messageIndex % diarizationLoadingMessages.length];
+                    } else if (this.options.diarize && this.progress < 85) {
+                        // Diarization processing (38-85%)
+                        const subProgress = Math.round(((this.progress - 38) / 47) * 100);
+                        this.statusText = `${diarizationMessages[messageIndex % diarizationMessages.length]} ${subProgress}%`;
+                    } else if (this.options.diarize && this.progress < 90) {
+                        // Merging (85-90%)
+                        this.statusText = mergingMessages[messageIndex % mergingMessages.length];
+                    } else if (this.progress >= 88) {
+                        // Finalizing
+                        this.statusText = finalizationMessages[Math.min(messageIndex % finalizationMessages.length, finalizationMessages.length - 1)];
+                    } else {
+                        // Default to transcription messages for non-diarization
+                        this.statusText = transcriptionMessages[messageIndex % transcriptionMessages.length];
+                    }
+                    messageIndex++;
                 }
-            }, 100);
+                
+                // Initial message
+                if (elapsedTime < 0.5) {
+                    this.statusText = '🔄 Initialisation du modèle...';
+                }
+                
+            }, 200);
         },
         
         /**
@@ -457,6 +567,28 @@ function sttApp() {
         },
         
         /**
+         * Format processing duration for display (more detailed for history)
+         */
+        formatProcessingDuration(seconds) {
+            if (!seconds) return '';
+            
+            if (seconds < 60) {
+                return `${Math.round(seconds)}s`;
+            }
+            
+            const mins = Math.floor(seconds / 60);
+            const secs = Math.round(seconds % 60);
+            
+            if (mins < 60) {
+                return `${mins}m ${secs}s`;
+            }
+            
+            const hours = Math.floor(mins / 60);
+            const remainMins = mins % 60;
+            return `${hours}h ${remainMins}m`;
+        },
+        
+        /**
          * Get language display name
          */
         getLanguageName(code) {
@@ -554,6 +686,13 @@ function sttApp() {
          * Start audio recording with real-time transcription
          */
         async startRecording() {
+            // Check if server is available before starting recording
+            await this.checkServerStatus();
+            if (this.serverProcessing.is_processing) {
+                this.dictationError = this.getBlockingMessage();
+                return;
+            }
+            
             try {
                 this.dictationError = null;
                 this.pendingTranscription = '';
@@ -725,6 +864,14 @@ function sttApp() {
         async processIntermediateRecording() {
             if (this._allChunks.length === 0) return;
             
+            // Check server status first
+            await this.checkServerStatus();
+            if (this.serverProcessing.is_processing && this.serverProcessing.processing_type !== 'dictation') {
+                // Another file is being processed, skip this chunk
+                console.log('Skipping intermediate transcription: server busy with file');
+                return;
+            }
+            
             this.dictationProcessing = true;
             
             try {
@@ -739,8 +886,9 @@ function sttApp() {
                 
                 // Create form data
                 const formData = new FormData();
-                formData.append('file', audioBlob, 'recording.webm');
+                formData.append('file', audioBlob, 'dictation.webm');
                 formData.append('response_format', 'json');
+                formData.append('processing_type', 'dictation');  // Don't save to history
                 
                 if (this.dictationOptions.language) {
                     formData.append('language', this.dictationOptions.language);
@@ -753,6 +901,11 @@ function sttApp() {
                 });
                 
                 if (!response.ok) {
+                    // If server is busy (503), just skip this chunk
+                    if (response.status === 503) {
+                        console.log('Server busy, skipping intermediate transcription');
+                        return;
+                    }
                     const errorData = await response.json().catch(() => ({}));
                     throw new Error(errorData.detail || `Erreur ${response.status}`);
                 }
@@ -791,8 +944,9 @@ function sttApp() {
                 
                 // Create form data
                 const formData = new FormData();
-                formData.append('file', audioBlob, 'recording.webm');
+                formData.append('file', audioBlob, 'dictation_final.webm');
                 formData.append('response_format', 'json');
+                formData.append('processing_type', 'dictation');  // Don't save to history
                 
                 if (this.dictationOptions.language) {
                     formData.append('language', this.dictationOptions.language);
@@ -806,6 +960,10 @@ function sttApp() {
                 
                 if (!response.ok) {
                     const errorData = await response.json().catch(() => ({}));
+                    // Show specific message for busy server
+                    if (response.status === 503) {
+                        throw new Error('Le serveur est occupé par un autre traitement. Veuillez réessayer.');
+                    }
                     throw new Error(errorData.detail || `Erreur ${response.status}`);
                 }
                 
@@ -864,26 +1022,209 @@ function sttApp() {
          */
         init() {
             this.loadSettings();
-            // Auto-test connection if URL is set
-            if (this.ollamaSettings.url) {
-                this.testOllamaConnection();
+            // Load server settings (retention days)
+            this.loadServerSettings();
+            // Check Ollama status from backend (configured via .env)
+            this.checkOllamaStatus();
+            // Check server status immediately and periodically
+            this.checkServerStatus();
+            this.statusCheckInterval = setInterval(() => {
+                this.checkServerStatus();
+            }, 2000); // Check every 2 seconds
+        },
+        
+        /**
+         * Load server-side settings
+         */
+        async loadServerSettings() {
+            try {
+                const response = await fetch('/settings');
+                if (response.ok) {
+                    const data = await response.json();
+                    this.retentionDays = data.retention_days || 90;
+                }
+            } catch (err) {
+                console.error('Failed to load server settings:', err);
             }
         },
         
         /**
-         * Test Ollama connection and fetch models
+         * Save retention days setting
          */
-        async testOllamaConnection() {
+        async saveRetentionDays() {
+            this.retentionLoading = true;
+            
+            try {
+                const response = await fetch('/settings/retention', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ days: parseInt(this.retentionDays) || 90 })
+                });
+                
+                if (response.ok) {
+                    const data = await response.json();
+                    this.retentionDays = data.retention_days;
+                    alert('Durée de conservation mise à jour !');
+                } else {
+                    const errorData = await response.json().catch(() => ({}));
+                    throw new Error(errorData.detail || 'Erreur lors de la sauvegarde');
+                }
+            } catch (err) {
+                console.error('Failed to save retention days:', err);
+                alert('Erreur: ' + err.message);
+            } finally {
+                this.retentionLoading = false;
+            }
+        },
+        
+        /**
+         * Check if the server is currently processing something
+         */
+        async checkServerStatus() {
+            try {
+                const response = await fetch('/status');
+                if (response.ok) {
+                    const status = await response.json();
+                    this.serverProcessing = status;
+                    
+                    // Update progress from server if we're processing and server has progress info
+                    if (this.processing && status.is_processing && status.progress_percent > 0) {
+                        this.useServerProgress = true;
+                        this.progress = status.progress_percent;
+                        this.updateStatusFromServer(status);
+                    }
+                }
+            } catch (err) {
+                // Silent fail - server might be busy
+                console.debug('Status check failed:', err);
+            }
+        },
+        
+        /**
+         * Update status text based on server progress info
+         */
+        updateStatusFromServer(status) {
+            const step = status.current_step;
+            const chunk = status.current_chunk;
+            const total = status.total_chunks;
+            const percent = status.progress_percent;
+            
+            switch (step) {
+                case 'uploading':
+                    this.statusText = '📤 Envoi du fichier...';
+                    break;
+                case 'transcribing':
+                    if (status.audio_duration > 0) {
+                        const mins = Math.floor(status.audio_duration / 60);
+                        const secs = Math.round(status.audio_duration % 60);
+                        if (mins > 0) {
+                            this.statusText = `🎤 Transcription en cours... (${mins}m${secs}s d'audio)`;
+                        } else {
+                            this.statusText = `🎤 Transcription en cours... (${secs}s d'audio)`;
+                        }
+                    } else {
+                        this.statusText = '🎤 Transcription en cours...';
+                    }
+                    break;
+                case 'diarizing_loading':
+                    this.statusText = '👥 Chargement du modèle de diarisation...';
+                    break;
+                case 'diarizing_processing':
+                    // For short audio, show progress based on percent
+                    if (percent >= 40 && percent < 85) {
+                        const subProgress = Math.round(((percent - 40) / 45) * 100);
+                        this.statusText = `👥 Analyse des voix... ${subProgress}%`;
+                    } else {
+                        this.statusText = '👥 Analyse des voix en cours...';
+                    }
+                    break;
+                case 'diarizing_chunk':
+                    if (total > 0) {
+                        this.statusText = `👥 Diarisation: segment ${chunk}/${total}`;
+                    } else {
+                        this.statusText = '👥 Analyse des locuteurs...';
+                    }
+                    break;
+                case 'diarizing_merging':
+                    this.statusText = '👥 Harmonisation des locuteurs...';
+                    break;
+                case 'merging':
+                    this.statusText = '🔗 Fusion transcription et locuteurs...';
+                    break;
+                case 'finalizing':
+                    this.statusText = '📝 Finalisation...';
+                    break;
+                default:
+                    // Keep current status text for unknown steps
+                    break;
+            }
+        },
+        
+        /**
+         * Check if we can start a new processing task
+         * Returns true if available, false if blocked
+         */
+        canStartProcessing() {
+            return !this.serverProcessing.is_processing && !this.processing && !this.dictationProcessing;
+        },
+        
+        /**
+         * Get blocking message if processing is blocked
+         */
+        getBlockingMessage() {
+            if (this.serverProcessing.is_processing) {
+                const type = this.serverProcessing.processing_type === 'dictation' ? 'une dictée' : 'un fichier';
+                const file = this.serverProcessing.current_file || 'inconnu';
+                return `Impossible de démarrer : ${type} est en cours de traitement (${file}). Veuillez attendre la fin de l'opération.`;
+            }
+            if (this.processing) {
+                return 'Une transcription de fichier est en cours. Veuillez attendre.';
+            }
+            if (this.dictationProcessing) {
+                return 'Une dictée est en cours de traitement. Veuillez attendre.';
+            }
+            return null;
+        },
+        
+        /**
+         * Request cancellation of current processing
+         */
+        async cancelProcessing() {
+            if (!this.processing && !this.serverProcessing.is_processing) return;
+            
+            this.cancelRequested = true;
+            this.statusText = '⏹️ Annulation en cours...';
+            
+            try {
+                const response = await fetch('/cancel', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    this.statusText = '⏹️ Annulation demandée, en attente...';
+                } else {
+                    this.cancelRequested = false;
+                }
+            } catch (err) {
+                console.error('Cancel request failed:', err);
+                this.cancelRequested = false;
+            }
+        },
+        
+        /**
+         * Check Ollama status from backend
+         */
+        async checkOllamaStatus() {
             this.ollamaLoading = true;
             this.ollamaStatus = '';
             this.ollamaConnected = false;
+            this.ollamaConfigured = false;
             
             try {
-                // Fetch models from Ollama API
-                const response = await fetch(`${this.ollamaSettings.url}/api/tags`, {
-                    method: 'GET',
-                    headers: { 'Content-Type': 'application/json' }
-                });
+                const response = await fetch('/ollama/status');
                 
                 if (!response.ok) {
                     throw new Error(`HTTP ${response.status}`);
@@ -891,26 +1232,23 @@ function sttApp() {
                 
                 const data = await response.json();
                 
-                // Extract model names
-                this.ollamaModels = (data.models || []).map(m => m.name);
+                this.ollamaConfigured = data.configured;
+                this.ollamaConnected = data.connected;
+                this.ollamaModels = data.models || [];
+                this.ollamaStatus = data.message;
                 
-                if (this.ollamaModels.length === 0) {
-                    this.ollamaStatus = 'Connecté mais aucun modèle trouvé';
-                    this.ollamaConnected = true;
-                } else {
-                    this.ollamaStatus = `Connecté - ${this.ollamaModels.length} modèle(s)`;
-                    this.ollamaConnected = true;
-                    
-                    // Auto-select first model if none selected
-                    if (!this.ollamaSettings.model && this.ollamaModels.length > 0) {
-                        this.ollamaSettings.model = this.ollamaModels[0];
-                    }
+                // Use server-configured model or first available
+                if (data.model) {
+                    this.ollamaSettings.model = data.model;
+                } else if (this.ollamaModels.length > 0 && !this.ollamaSettings.model) {
+                    this.ollamaSettings.model = this.ollamaModels[0];
                 }
                 
             } catch (err) {
-                console.error('Ollama connection error:', err);
+                console.error('Ollama status check error:', err);
                 this.ollamaStatus = `Erreur: ${err.message}`;
                 this.ollamaConnected = false;
+                this.ollamaConfigured = false;
                 this.ollamaModels = [];
             } finally {
                 this.ollamaLoading = false;
@@ -922,7 +1260,7 @@ function sttApp() {
          */
         async applyLLMPrompt(promptIndex) {
             if (!this.ollamaConnected || !this.ollamaSettings.model) {
-                this.error = 'Configurez Ollama dans l\'onglet Paramètres';
+                this.error = 'Ollama non configuré ou non connecté. Vérifiez la configuration dans .env';
                 return;
             }
             
@@ -944,8 +1282,8 @@ function sttApp() {
                 // Replace {text} placeholder with actual transcription
                 const fullPrompt = prompt.content.replace('{text}', textToProcess);
                 
-                // Call Ollama API
-                const response = await fetch(`${this.ollamaSettings.url}/api/generate`, {
+                // Call backend proxy endpoint
+                const response = await fetch('/ollama/generate', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -956,7 +1294,8 @@ function sttApp() {
                 });
                 
                 if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}`);
+                    const errorData = await response.json().catch(() => ({}));
+                    throw new Error(errorData.detail || `HTTP ${response.status}`);
                 }
                 
                 const data = await response.json();
@@ -1188,113 +1527,6 @@ em { font-style: italic; }
         },
         
         /**
-         * Choose save folder using File System Access API
-         */
-        async chooseSaveFolder() {
-            try {
-                // Check if File System Access API is supported
-                if ('showDirectoryPicker' in window) {
-                    const handle = await window.showDirectoryPicker({
-                        mode: 'readwrite'
-                    });
-                    this.saveOptions.folderHandle = handle;
-                    this.saveOptions.folderName = handle.name;
-                    
-                    // Save to localStorage for persistence
-                    localStorage.setItem('mywhisper_save_folder_name', handle.name);
-                } else {
-                    alert('Votre navigateur ne supporte pas la sélection de dossier.\nLes fichiers seront téléchargés dans votre dossier Téléchargements par défaut.');
-                }
-            } catch (err) {
-                if (err.name !== 'AbortError') {
-                    console.error('Folder selection error:', err);
-                }
-            }
-        },
-        
-        /**
-         * Save result to file
-         */
-        async saveResultToFile(content, filename) {
-            if (!this.saveOptions.enabled) return;
-            
-            try {
-                if (this.saveOptions.folderHandle) {
-                    // Use File System Access API to save directly to folder
-                    await this.saveToFolder(content, filename);
-                } else {
-                    // Fallback to standard download
-                    this.downloadFile(content, filename);
-                }
-            } catch (err) {
-                console.error('Save error:', err);
-                // Fallback to standard download on error
-                this.downloadFile(content, filename);
-            }
-        },
-        
-        /**
-         * Save file directly to selected folder
-         */
-        async saveToFolder(content, filename) {
-            try {
-                const fileHandle = await this.saveOptions.folderHandle.getFileHandle(filename, { create: true });
-                const writable = await fileHandle.createWritable();
-                await writable.write(content);
-                await writable.close();
-                console.log(`File saved: ${filename}`);
-            } catch (err) {
-                console.error('Error saving to folder:', err);
-                // Permission might have been revoked, reset folder handle
-                if (err.name === 'NotAllowedError') {
-                    this.saveOptions.folderHandle = null;
-                    this.saveOptions.folderName = '';
-                    alert('Permission refusée. Veuillez resélectionner le dossier.');
-                }
-                throw err;
-            }
-        },
-        
-        /**
-         * Standard file download
-         */
-        downloadFile(content, filename) {
-            const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = filename;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-        },
-        
-        /**
-         * Generate filename for save
-         */
-        generateSaveFilename() {
-            const baseName = this.selectedFile ? 
-                this.selectedFile.name.replace(/\.[^/.]+$/, '') : 
-                'transcription';
-            const timestamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
-            const extension = this.getFileExtension();
-            return `${baseName}_${timestamp}${extension}`;
-        },
-        
-        /**
-         * Get file extension based on format
-         */
-        getFileExtension() {
-            switch (this.options.format) {
-                case 'srt': return '.srt';
-                case 'vtt': return '.vtt';
-                case 'json': return '.json';
-                default: return '.txt';
-            }
-        },
-        
-        /**
          * Add a new custom prompt
          */
         addPrompt() {
@@ -1312,11 +1544,10 @@ em { font-style: italic; }
         },
         
         /**
-         * Save settings to localStorage
+         * Save settings to localStorage (only custom prompts, Ollama URL is in .env)
          */
         saveSettings() {
             const settings = {
-                ollamaSettings: this.ollamaSettings,
                 customPrompts: this.customPrompts
             };
             localStorage.setItem('mywhisper_settings', JSON.stringify(settings));
@@ -1331,15 +1562,167 @@ em { font-style: italic; }
                 const saved = localStorage.getItem('mywhisper_settings');
                 if (saved) {
                     const settings = JSON.parse(saved);
-                    if (settings.ollamaSettings) {
-                        this.ollamaSettings = { ...this.ollamaSettings, ...settings.ollamaSettings };
-                    }
                     if (settings.customPrompts && settings.customPrompts.length > 0) {
                         this.customPrompts = settings.customPrompts;
                     }
                 }
             } catch (err) {
                 console.error('Failed to load settings:', err);
+            }
+        },
+        
+        // ===== HISTORY FUNCTIONS =====
+        
+        /**
+         * Load history from server
+         */
+        async loadHistory(offset = 0) {
+            this.historyLoading = true;
+            this.historyOffset = Math.max(0, offset);
+            
+            try {
+                const response = await fetch(`/history?limit=${this.historyLimit}&offset=${this.historyOffset}`);
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                
+                const data = await response.json();
+                
+                // Add downloadFormat property to each item
+                this.historyItems = data.transcriptions.map(item => ({
+                    ...item,
+                    downloadFormat: item.format || 'text'
+                }));
+                this.historyTotal = data.total;
+                
+            } catch (err) {
+                console.error('Failed to load history:', err);
+                this.historyItems = [];
+                this.historyTotal = 0;
+            } finally {
+                this.historyLoading = false;
+            }
+        },
+        
+        /**
+         * Format history date for display
+         */
+        formatHistoryDate(dateStr) {
+            if (!dateStr) return '';
+            
+            const date = new Date(dateStr);
+            const now = new Date();
+            const diffMs = now - date;
+            const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+            
+            if (diffDays === 0) {
+                return `Aujourd'hui à ${date.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}`;
+            } else if (diffDays === 1) {
+                return `Hier à ${date.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}`;
+            } else if (diffDays < 7) {
+                return `Il y a ${diffDays} jours`;
+            } else {
+                return date.toLocaleDateString('fr-FR', { day: '2-digit', month: '2-digit', year: 'numeric' });
+            }
+        },
+        
+        /**
+         * Download a history item
+         */
+        async downloadHistoryItem(item) {
+            try {
+                const format = item.downloadFormat || 'text';
+                const response = await fetch(`/history/${item.id}/download?format=${format}`);
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                
+                const content = await response.text();
+                
+                // Determine file extension
+                const extensions = { text: 'txt', json: 'json', srt: 'srt', vtt: 'vtt' };
+                const ext = extensions[format] || 'txt';
+                
+                // Generate filename
+                const baseName = item.filename.replace(/\.[^/.]+$/, '');
+                const filename = `${baseName}.${ext}`;
+                
+                // Download
+                const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                
+            } catch (err) {
+                console.error('Download failed:', err);
+                alert('Erreur lors du téléchargement');
+            }
+        },
+        
+        /**
+         * View a history item in modal
+         */
+        async viewHistoryItem(item) {
+            try {
+                const response = await fetch(`/history/${item.id}`);
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                
+                const fullItem = await response.json();
+                this.historyViewItem = fullItem;
+                
+            } catch (err) {
+                console.error('Failed to load item:', err);
+                alert('Erreur lors du chargement');
+            }
+        },
+        
+        /**
+         * Copy history item content to clipboard
+         */
+        async copyHistoryItem(item) {
+            if (!item || !item.result_text) return;
+            
+            try {
+                await navigator.clipboard.writeText(item.result_text);
+                alert('Copié dans le presse-papier !');
+            } catch (err) {
+                console.error('Copy failed:', err);
+            }
+        },
+        
+        /**
+         * Delete a history item
+         */
+        async deleteHistoryItem(item) {
+            if (!confirm(`Supprimer la transcription "${item.filename}" ?`)) {
+                return;
+            }
+            
+            try {
+                const response = await fetch(`/history/${item.id}`, {
+                    method: 'DELETE'
+                });
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                
+                // Reload history
+                await this.loadHistory(this.historyOffset);
+                
+            } catch (err) {
+                console.error('Delete failed:', err);
+                alert('Erreur lors de la suppression');
             }
         }
     };

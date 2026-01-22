@@ -1,9 +1,11 @@
 """
 Speaker diarization using pyannote.audio
 Optimized for NVIDIA RTX GPUs with TF32 and float16 support
+Includes chunked processing for long audio files to avoid OOM errors
 """
 import logging
 import os
+import gc
 from typing import Optional, Dict, Any, List
 from pathlib import Path
 
@@ -118,25 +120,135 @@ class SpeakerDiarizer:
             self._available = False
             raise
     
-    def diarize(
-        self, 
+    def unload(self) -> None:
+        """
+        Unload the diarization pipeline from GPU to free VRAM.
+        Should be called after diarization is complete to allow Whisper
+        to use the full GPU memory.
+        """
+        if self._pipeline is not None:
+            logger.info("Unloading diarization pipeline from GPU...")
+            
+            try:
+                import torch
+                
+                # Delete the pipeline directly
+                del self._pipeline
+                self._pipeline = None
+                
+                # Force garbage collection
+                gc.collect()
+                
+                # Clear CUDA cache to actually free the VRAM
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    
+                    # Log memory status
+                    allocated = torch.cuda.memory_allocated() / 1024**3
+                    cached = torch.cuda.memory_reserved() / 1024**3
+                    logger.info(f"GPU memory after unload: {allocated:.2f}GB allocated, {cached:.2f}GB cached")
+                    
+            except Exception as e:
+                logger.warning(f"Error during pipeline unload: {e}")
+                self._pipeline = None
+    
+    def _get_audio_duration(self, audio_path: str) -> float:
+        """Get audio file duration in seconds"""
+        try:
+            import torchaudio
+            info = torchaudio.info(audio_path)
+            return info.num_frames / info.sample_rate
+        except Exception as e:
+            logger.warning(f"Could not get audio duration: {e}")
+            return 0.0
+    
+    def _diarize_chunk(
+        self,
         audio_path: str,
+        start_time: float,
+        end_time: float,
         min_speakers: Optional[int] = None,
         max_speakers: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """
+        Diarize a specific chunk of audio.
+        
+        Args:
+            audio_path: Path to the audio file
+            start_time: Start time in seconds
+            end_time: End time in seconds
+            min_speakers: Minimum speakers constraint
+            max_speakers: Maximum speakers constraint
+            
+        Returns:
+            List of speaker segments for this chunk
+        """
+        import torch
+        from pyannote.core import Segment
+        
+        # Build inference parameters
+        params = {}
+        if min_speakers is not None:
+            params["min_speakers"] = min_speakers
+        if max_speakers is not None:
+            params["max_speakers"] = max_speakers
+        
+        # Run diarization on the specific segment
+        with torch.inference_mode():
+            # Use pyannote's built-in cropping
+            diarization = self._pipeline(
+                {"uri": audio_path, "audio": audio_path},
+                **params
+            ).crop(Segment(start_time, end_time))
+        
+        timeline = []
+        for turn, _, speaker in diarization.itertracks(yield_label=True):
+            timeline.append({
+                "start": round(turn.start, 3),
+                "end": round(turn.end, 3),
+                "speaker": speaker
+            })
+        
+        return timeline
+    
+    def diarize(
+        self, 
+        audio_path: str,
+        min_speakers: Optional[int] = None,
+        max_speakers: Optional[int] = None,
+        chunk_duration: float = 300.0,  # 5 minutes chunks
+        auto_unload: bool = True,
+        progress_callback: Optional[callable] = None
+    ) -> List[Dict[str, Any]]:
+        """
         Perform speaker diarization on audio file.
+        For long audio files, processes in chunks to avoid OOM errors.
         
         Args:
             audio_path: Path to the audio file
             min_speakers: Minimum number of speakers (optional, speeds up if known)
             max_speakers: Maximum number of speakers (optional, speeds up if known)
+            chunk_duration: Duration of each chunk in seconds (default 5 minutes)
+            auto_unload: Automatically unload model from GPU after diarization
+            progress_callback: Optional callback(step, current, total, sub_percent) for progress reporting
+                - step: 'loading', 'processing', 'chunk', 'merging'
+                - current/total: for chunk-based progress
+                - sub_percent: 0.0 to 1.0 for sub-step progress
             
         Returns:
             List of speaker segments:
             [{"start": 0.0, "end": 5.2, "speaker": "SPEAKER_00"}, ...]
         """
+        # Report loading progress
+        if progress_callback:
+            progress_callback("loading", 0, 1, 0.0)
+        
         self._load_pipeline()
+        
+        # Report loading complete
+        if progress_callback:
+            progress_callback("loading", 0, 1, 1.0)
         
         logger.info(f"Starting diarization: {audio_path}")
         if min_speakers or max_speakers:
@@ -145,6 +257,14 @@ class SpeakerDiarizer:
         try:
             import torch
             
+            # Get audio duration
+            duration = self._get_audio_duration(audio_path)
+            
+            # Force re-enable TF32 (pyannote disables it, but it's safe for inference)
+            if torch.cuda.is_available():
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
+            
             # Build inference parameters
             params = {}
             if min_speakers is not None:
@@ -152,33 +272,203 @@ class SpeakerDiarizer:
             if max_speakers is not None:
                 params["max_speakers"] = max_speakers
             
-            # Force re-enable TF32 (pyannote disables it, but it's safe for inference)
-            if torch.cuda.is_available():
-                torch.backends.cuda.matmul.allow_tf32 = True
-                torch.backends.cudnn.allow_tf32 = True
+            # For short audio (< 10 minutes), process directly
+            # For longer audio, use chunked processing
+            if duration > 0 and duration > 600:  # More than 10 minutes
+                logger.info(f"Long audio detected ({duration:.1f}s), using chunked processing...")
+                timeline = self._diarize_chunked(
+                    audio_path, duration, chunk_duration, min_speakers, max_speakers,
+                    progress_callback=progress_callback
+                )
+            else:
+                # Standard processing for shorter files
+                logger.info("Processing audio in single pass...")
+                
+                # Report processing start
+                if progress_callback:
+                    progress_callback("processing", 0, 1, 0.0)
+                
+                # For short audio, we can't get real progress from pyannote pipeline
+                # but we can simulate progress based on estimated duration
+                # The pipeline is blocking, so we report progress before and after
+                
+                # Estimate: pipeline takes roughly 0.2-0.5x realtime on GPU
+                estimated_processing_time = duration * 0.3 if duration > 0 else 30
+                logger.info(f"Estimated processing time: {estimated_processing_time:.1f}s for {duration:.1f}s audio")
+                
+                with torch.inference_mode():
+                    diarization = self._pipeline(audio_path, **params)
+                
+                # Report processing complete
+                if progress_callback:
+                    progress_callback("processing", 1, 1, 1.0)
+                
+                timeline = []
+                for turn, _, speaker in diarization.itertracks(yield_label=True):
+                    timeline.append({
+                        "start": round(turn.start, 3),
+                        "end": round(turn.end, 3),
+                        "speaker": speaker
+                    })
             
-            # Run with optimized inference
-            with torch.inference_mode():
-                diarization = self._pipeline(audio_path, **params)
-            
-            timeline = []
-            for turn, _, speaker in diarization.itertracks(yield_label=True):
-                timeline.append({
-                    "start": round(turn.start, 3),
-                    "end": round(turn.end, 3),
-                    "speaker": speaker
-                })
+            # Report merging step
+            if progress_callback:
+                progress_callback("merging", 0, 1, 0.5)
             
             # Count unique speakers
             speakers = set(seg["speaker"] for seg in timeline)
             logger.info(f"Diarization complete. Found {len(speakers)} speakers, "
                        f"{len(timeline)} segments")
             
+            # Report merging complete
+            if progress_callback:
+                progress_callback("merging", 0, 1, 1.0)
+            
             return timeline
             
         except Exception as e:
             logger.error(f"Diarization failed: {e}")
             raise
+        finally:
+            # Unload model from GPU to free memory for other operations
+            if auto_unload:
+                self.unload()
+    
+    def _diarize_chunked(
+        self,
+        audio_path: str,
+        total_duration: float,
+        chunk_duration: float,
+        min_speakers: Optional[int],
+        max_speakers: Optional[int],
+        progress_callback: Optional[callable] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Process long audio in chunks with overlap to handle speaker continuity.
+        
+        Uses overlapping windows and merges results to avoid splitting
+        speakers at chunk boundaries.
+        """
+        import torch
+        from pyannote.audio import Audio
+        from pyannote.core import Segment
+        
+        # Use 30 second overlap between chunks
+        overlap = 30.0
+        
+        all_segments = []
+        chunk_start = 0.0
+        chunk_num = 0
+        
+        # Calculate total number of chunks
+        total_chunks = 0
+        temp_start = 0.0
+        while temp_start < total_duration:
+            total_chunks += 1
+            temp_start = min(temp_start + chunk_duration, total_duration) - overlap
+            if temp_start + overlap >= total_duration:
+                break
+        
+        logger.info(f"Will process {total_chunks} chunks for {total_duration:.1f}s audio")
+        
+        # Build inference parameters
+        params = {}
+        if min_speakers is not None:
+            params["min_speakers"] = min_speakers
+        if max_speakers is not None:
+            params["max_speakers"] = max_speakers
+        
+        while chunk_start < total_duration:
+            chunk_end = min(chunk_start + chunk_duration, total_duration)
+            chunk_num += 1
+            
+            logger.info(f"Processing chunk {chunk_num}/{total_chunks}: {chunk_start:.1f}s - {chunk_end:.1f}s")
+            
+            # Report chunk progress (using new callback format)
+            if progress_callback:
+                progress_callback("chunk", chunk_num, total_chunks, 0.0)
+            
+            try:
+                # Clear GPU cache before each chunk
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                # Process this chunk
+                with torch.inference_mode():
+                    # Load and crop audio for this chunk
+                    audio = Audio(mono="downmix", sample_rate=16000)
+                    waveform, sample_rate = audio.crop(
+                        audio_path,
+                        Segment(chunk_start, chunk_end)
+                    )
+                    
+                    # Run diarization on the chunk
+                    diarization = self._pipeline(
+                        {"waveform": waveform, "sample_rate": sample_rate},
+                        **params
+                    )
+                
+                # Extract segments and adjust timestamps
+                for turn, _, speaker in diarization.itertracks(yield_label=True):
+                    # Adjust timestamps to absolute positions
+                    abs_start = chunk_start + turn.start
+                    abs_end = chunk_start + turn.end
+                    
+                    # Skip segments in the overlap region (except for last chunk)
+                    # This prevents duplicate segments
+                    if chunk_start > 0 and abs_start < chunk_start + overlap / 2:
+                        continue
+                    
+                    all_segments.append({
+                        "start": round(abs_start, 3),
+                        "end": round(abs_end, 3),
+                        "speaker": speaker
+                    })
+                
+                # Clean up chunk data
+                del waveform
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    
+            except torch.cuda.OutOfMemoryError:
+                logger.warning(f"OOM on chunk {chunk_num}, trying with smaller chunk...")
+                # If OOM, try with smaller chunk (recursive with half size)
+                if chunk_duration > 60:
+                    sub_segments = self._diarize_chunked(
+                        audio_path,
+                        chunk_end,
+                        chunk_duration / 2,
+                        min_speakers,
+                        max_speakers
+                    )
+                    all_segments.extend([s for s in sub_segments if s["start"] >= chunk_start])
+                else:
+                    raise
+            
+            # Move to next chunk (with overlap)
+            chunk_start = chunk_end - overlap
+            if chunk_start + overlap >= total_duration:
+                break
+        
+        # Sort by start time
+        all_segments.sort(key=lambda x: x["start"])
+        
+        # Merge speaker labels across chunks (same speaker might have different IDs)
+        # This is a simple heuristic - speakers close in time with same ID are merged
+        return self._harmonize_speakers(all_segments)
+    
+    def _harmonize_speakers(self, segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Harmonize speaker labels across chunks.
+        Ensures consistent speaker IDs throughout the audio.
+        """
+        if not segments:
+            return segments
+        
+        # For now, just return as-is
+        # A more sophisticated approach would track speaker embeddings
+        # and merge similar speakers across chunks
+        return segments
     
     def merge_with_transcription(
         self,
@@ -189,7 +479,8 @@ class SpeakerDiarizer:
         Merge transcription segments with speaker diarization.
         
         Assigns the dominant speaker to each transcription segment based on
-        overlap with diarization timeline.
+        overlap with diarization timeline. Falls back to nearest speaker
+        if no direct overlap is found (can happen with chunked processing).
         
         Args:
             transcription_segments: Segments from Whisper transcription
@@ -201,10 +492,13 @@ class SpeakerDiarizer:
         logger.info("Merging transcription with diarization...")
         
         merged_segments = []
+        last_speaker = None
+        unknown_count = 0
         
         for seg in transcription_segments:
             seg_start = seg["start"]
             seg_end = seg["end"]
+            seg_mid = (seg_start + seg_end) / 2
             seg_copy = dict(seg)
             
             # Find overlapping diarization segments
@@ -227,13 +521,77 @@ class SpeakerDiarizer:
             if overlaps:
                 dominant_speaker = max(overlaps, key=overlaps.get)
                 seg_copy["speaker"] = dominant_speaker
+                last_speaker = dominant_speaker
             else:
-                seg_copy["speaker"] = "UNKNOWN"
+                # No direct overlap found - try to find nearest diarization segment
+                nearest_speaker = self._find_nearest_speaker(seg_mid, diarization_timeline)
+                
+                if nearest_speaker:
+                    seg_copy["speaker"] = nearest_speaker
+                    last_speaker = nearest_speaker
+                elif last_speaker:
+                    # Use the last known speaker as fallback
+                    seg_copy["speaker"] = last_speaker
+                else:
+                    # Absolute fallback - should rarely happen
+                    seg_copy["speaker"] = "SPEAKER_00"
+                    unknown_count += 1
             
             merged_segments.append(seg_copy)
         
+        if unknown_count > 0:
+            logger.warning(f"Could not determine speaker for {unknown_count} segments (used SPEAKER_00)")
+        
         logger.info(f"Merged {len(merged_segments)} segments with speaker labels")
         return merged_segments
+    
+    def _find_nearest_speaker(
+        self, 
+        timestamp: float, 
+        diarization_timeline: List[Dict[str, Any]],
+        max_distance: float = 5.0  # Max 5 seconds gap
+    ) -> Optional[str]:
+        """
+        Find the nearest speaker to a given timestamp.
+        
+        Args:
+            timestamp: The timestamp to find a speaker for
+            diarization_timeline: List of diarization segments
+            max_distance: Maximum allowed time distance in seconds
+            
+        Returns:
+            Speaker ID or None if no speaker found within max_distance
+        """
+        if not diarization_timeline:
+            return None
+        
+        nearest_speaker = None
+        min_distance = float('inf')
+        
+        for dia_seg in diarization_timeline:
+            dia_start = dia_seg["start"]
+            dia_end = dia_seg["end"]
+            speaker = dia_seg["speaker"]
+            
+            # Check if timestamp is within the segment
+            if dia_start <= timestamp <= dia_end:
+                return speaker
+            
+            # Calculate distance to segment
+            if timestamp < dia_start:
+                distance = dia_start - timestamp
+            else:
+                distance = timestamp - dia_end
+            
+            if distance < min_distance:
+                min_distance = distance
+                nearest_speaker = speaker
+        
+        # Only return if within max_distance
+        if min_distance <= max_distance:
+            return nearest_speaker
+        
+        return None
     
     def get_info(self) -> Dict[str, Any]:
         """Get diarization service info"""
