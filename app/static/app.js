@@ -425,6 +425,11 @@ function sttApp() {
                 this.useServerProgress = true;
             }
             
+            // Don't update status text if cancellation was requested
+            if (this.cancelRequested) {
+                return;
+            }
+            
             const step = progress.step;
             switch (step) {
                 case 'transcribing':
