@@ -4,7 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PIP_NO_CACHE_DIR=1
 
-# Install system dependencies
+# Install system dependencies (rarely changes - cached)
 RUN apt-get update && apt-get install -y \
     python3.11 \
     python3.11-dev \
@@ -29,16 +29,19 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /app
 
-# Copy requirements first for better caching
+# Create directories early (cached)
+RUN mkdir -p /app/uploads /app/outputs /app/models /app/app/static
+
+# Copy requirements and install dependencies (cached unless requirements.txt changes)
 COPY requirements.txt .
 RUN pip3 install --upgrade pip && \
     pip3 install --no-cache-dir -r requirements.txt
 
-# Copy application
-COPY app/ ./app/
+# Copy Python files (changes less frequently than static files)
+COPY app/*.py ./app/
 
-# Create directories
-RUN mkdir -p /app/uploads /app/outputs /app/models
+# Copy static files last (changes most frequently - only this layer rebuilds)
+COPY app/static/ ./app/static/
 
 # Expose port
 EXPOSE 8000
