@@ -12,6 +12,8 @@ import logging
 import asyncio
 import json
 import time
+import math
+from threading import Thread
 from pathlib import Path
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -373,9 +375,7 @@ async def _process_transcription_stream(
     Process transcription with SSE streaming to prevent proxy timeouts.
     Sends progress updates every few seconds to keep connection alive.
     """
-    import asyncio
     from queue import Queue
-    from threading import Thread
     
     # Check if already processing
     if processing_state.is_processing:
@@ -414,10 +414,48 @@ async def _process_transcription_stream(
     # Queue for communication between processing thread and SSE stream
     result_queue = Queue()
     
+    # Flag to stop progress simulation
+    stop_progress_simulation = {"value": False}
+    
+    def simulate_transcription_progress(file_size_mb: float, has_diarize: bool):
+        """
+        Simulate progress during Whisper transcription.
+        Whisper doesn't provide progress callbacks, so we estimate based on file size.
+        """
+        import time as time_module
+        
+        # Estimate processing time: ~1 minute per 10MB for transcription
+        estimated_seconds = max(10, file_size_mb * 6)
+        
+        # Progress range: 5% to 30% (with diarize) or 5% to 85% (without)
+        start_percent = 5
+        end_percent = 28 if has_diarize else 85
+        
+        start_time = time_module.time()
+        
+        while not stop_progress_simulation["value"]:
+            elapsed = time_module.time() - start_time
+            
+            # Asymptotic progress (slows down as it approaches end)
+            progress_ratio = 1 - math.exp(-2.5 * elapsed / estimated_seconds)
+            current_percent = start_percent + int((end_percent - start_percent) * progress_ratio)
+            
+            # Don't exceed end percent
+            current_percent = min(current_percent, end_percent)
+            
+            processing_state.update_progress("transcribing", percent=current_percent)
+            
+            time_module.sleep(0.5)
+            
+            # Stop if we're very close to end or cancelled
+            if current_percent >= end_percent - 1 or processing_state.cancel_requested:
+                break
+    
     def run_transcription():
         """Run transcription in a separate thread"""
         temp_path = None
         processing_start_time = time.time()
+        progress_thread = None
         
         try:
             # Mark processing as started
@@ -439,12 +477,26 @@ async def _process_transcription_stream(
             
             processing_state.update_progress("transcribing", percent=5)
             
-            # Transcribe
+            # Start progress simulation thread
+            file_size_mb = file_size / (1024 * 1024)
+            stop_progress_simulation["value"] = False
+            progress_thread = Thread(
+                target=simulate_transcription_progress,
+                args=(file_size_mb, diarize)
+            )
+            progress_thread.start()
+            
+            # Transcribe (blocking call)
             result = transcriber.transcribe(
                 str(temp_path),
                 language=language,
                 vad_filter=True
             )
+            
+            # Stop progress simulation
+            stop_progress_simulation["value"] = True
+            if progress_thread:
+                progress_thread.join(timeout=1)
             
             audio_duration = result.get("duration", 0)
             processing_state.update_progress(
@@ -694,6 +746,29 @@ async def _process_transcription(
     
     # Now run the heavy processing in a separate thread
     # This allows the server to remain responsive
+    
+    # Flag to stop progress simulation
+    stop_progress_sim = {"value": False}
+    
+    def simulate_progress(file_size_mb: float, has_diarize: bool):
+        """Simulate progress during Whisper transcription."""
+        import time as time_mod
+        
+        estimated_seconds = max(10, file_size_mb * 6)
+        start_percent = 5
+        end_percent = 28 if has_diarize else 85
+        start_time = time_mod.time()
+        
+        while not stop_progress_sim["value"]:
+            elapsed = time_mod.time() - start_time
+            progress_ratio = 1 - math.exp(-2.5 * elapsed / estimated_seconds)
+            current_percent = start_percent + int((end_percent - start_percent) * progress_ratio)
+            current_percent = min(current_percent, end_percent)
+            processing_state.update_progress("transcribing", percent=current_percent)
+            time_mod.sleep(0.5)
+            if current_percent >= end_percent - 1 or processing_state.cancel_requested:
+                break
+    
     def run_blocking_transcription():
         """
         Synchronous function that runs in a separate thread.
@@ -701,6 +776,7 @@ async def _process_transcription(
         """
         temp_path = None
         processing_start_time = time.time()
+        progress_thread = None
         
         try:
             # Save to temp file
@@ -720,12 +796,26 @@ async def _process_transcription(
             # Update progress: transcription starting
             processing_state.update_progress("transcribing", percent=5)
             
+            # Start progress simulation thread
+            file_size_mb = file_size / (1024 * 1024)
+            stop_progress_sim["value"] = False
+            progress_thread = Thread(
+                target=simulate_progress,
+                args=(file_size_mb, diarize)
+            )
+            progress_thread.start()
+            
             # Transcribe (blocking call)
             result = transcriber.transcribe(
                 str(temp_path),
                 language=language,
                 vad_filter=True
             )
+            
+            # Stop progress simulation
+            stop_progress_sim["value"] = True
+            if progress_thread:
+                progress_thread.join(timeout=1)
             
             # Update progress: transcription complete
             audio_duration = result.get("duration", 0)
