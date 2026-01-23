@@ -247,6 +247,71 @@ class TranscriptionHistory:
             
             return deleted
     
+    def update_speaker_names(
+        self, 
+        record_id: int, 
+        speaker_names: Dict[str, str]
+    ) -> bool:
+        """
+        Update speaker names in a transcription record.
+        Replaces SPEAKER_XX with the provided names in both result_text and result_json.
+        
+        Args:
+            record_id: The transcription ID
+            speaker_names: Dict mapping speaker IDs to names (e.g., {"SPEAKER_00": "Jean"})
+            
+        Returns:
+            True if updated, False if not found
+        """
+        # Get current record
+        record = self.get_transcription(record_id)
+        if not record:
+            return False
+        
+        # Update result_text
+        result_text = record.get('result_text', '')
+        for speaker_id, name in speaker_names.items():
+            if name and name.strip():
+                result_text = result_text.replace(speaker_id, name.strip())
+        
+        # Update result_json if present
+        result_json = record.get('result_json')
+        if result_json and isinstance(result_json, dict):
+            # Update segments
+            segments = result_json.get('segments', [])
+            for segment in segments:
+                speaker = segment.get('speaker')
+                if speaker and speaker in speaker_names and speaker_names[speaker].strip():
+                    segment['speaker'] = speaker_names[speaker].strip()
+            
+            # Update text field if present
+            if 'text' in result_json:
+                for speaker_id, name in speaker_names.items():
+                    if name and name.strip():
+                        result_json['text'] = result_json['text'].replace(speaker_id, name.strip())
+        
+        # Save updated record
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                UPDATE transcriptions 
+                SET result_text = ?, result_json = ?
+                WHERE id = ?
+            """, (
+                result_text,
+                json.dumps(result_json) if result_json else None,
+                record_id
+            ))
+            
+            conn.commit()
+            updated = cursor.rowcount > 0
+            
+            if updated:
+                logger.info(f"Updated speaker names in history: ID {record_id}")
+            
+            return updated
+    
     def _cleanup_old_records(self, days: int = 90) -> int:
         """
         Remove records older than specified days.

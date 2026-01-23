@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MyWhisper - Transcription Audio</title>
-    <link rel="stylesheet" href="/static/styles.css?v=10">
+    <link rel="stylesheet" href="/static/styles.css?v=11">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -75,7 +75,7 @@
                  @dragover.prevent="dragActive = true"
                  @dragenter.prevent="dragActive = true"
                  @dragleave.prevent="dragActive = false"
-                 :class="{ 'drag-active': dragActive, 'has-file': selectedFile }">
+                 :class="{ 'drag-active': dragActive, 'has-file': selectedFile || getFileDisplayInfo() }">
                 
                 <input type="file" 
                        id="fileInput" 
@@ -83,7 +83,7 @@
                        @change="handleFileSelect($event)"
                        hidden>
                 
-                <div class="dropzone-content" x-show="!selectedFile">
+                <div class="dropzone-content" x-show="!selectedFile && !getFileDisplayInfo()">
                     <div class="dropzone-icon">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
                             <path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/>
@@ -100,7 +100,7 @@
                     </div>
                 </div>
                 
-                <div class="file-preview" x-show="selectedFile">
+                <div class="file-preview" x-show="selectedFile || getFileDisplayInfo()">
                     <div class="file-icon">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
                             <path d="M9 18V5l12-2v13"/>
@@ -109,10 +109,10 @@
                         </svg>
                     </div>
                     <div class="file-info">
-                        <span class="file-name" x-text="selectedFile?.name"></span>
-                        <span class="file-size" x-text="formatFileSize(selectedFile?.size)"></span>
+                        <span class="file-name" x-text="getFileDisplayInfo()?.name"></span>
+                        <span class="file-size" x-text="formatFileSize(getFileDisplayInfo()?.size)"></span>
                     </div>
-                    <button class="file-remove" @click.stop="removeFile()">
+                    <button class="file-remove" @click.stop="removeFile(); _restoredFileInfo = null">
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <line x1="18" y1="6" x2="6" y2="18"/>
                             <line x1="6" y1="6" x2="18" y2="18"/>
@@ -123,13 +123,13 @@
         </div>
         
         <!-- Options Panel -->
-        <div class="options-panel">
+        <div class="options-panel" :class="{ 'options-locked': processing }">
             <div class="option-group">
                 <label class="option-label">
                     <span class="option-icon">🌍</span>
                     Langue
                 </label>
-                <select x-model="options.language" class="select-input">
+                <select x-model="options.language" class="select-input" :disabled="processing">
                     <option value="">Détection automatique</option>
                     <option value="fr">Français</option>
                     <option value="en">English</option>
@@ -151,7 +151,7 @@
                     <span class="option-icon">📄</span>
                     Format
                 </label>
-                <select x-model="options.format" class="select-input">
+                <select x-model="options.format" class="select-input" :disabled="processing">
                     <option value="json">JSON (complet)</option>
                     <option value="text">Texte brut</option>
                     <option value="srt">SRT (sous-titres)</option>
@@ -160,8 +160,8 @@
             </div>
             
             <div class="option-group">
-                <label class="toggle-label">
-                    <input type="checkbox" x-model="options.diarize" class="toggle-input">
+                <label class="toggle-label" :class="{ 'toggle-disabled': processing }">
+                    <input type="checkbox" x-model="options.diarize" class="toggle-input" :disabled="processing">
                     <span class="toggle-switch"></span>
                     <span class="toggle-text">
                         <span class="option-icon">👥</span>
@@ -183,14 +183,16 @@
                            class="number-input" 
                            placeholder="Min"
                            min="1" 
-                           max="20">
+                           max="20"
+                           :disabled="processing">
                     <span class="speaker-separator">à</span>
                     <input type="number" 
                            x-model="options.maxSpeakers" 
                            class="number-input" 
                            placeholder="Max"
                            min="1" 
-                           max="20">
+                           max="20"
+                           :disabled="processing">
                 </div>
                 <span class="option-hint">Accélère le traitement si connu</span>
             </div>
@@ -307,6 +309,22 @@
                         <div class="speaker-id">
                             <span class="speaker-badge" x-text="speaker"></span>
                         </div>
+                        
+                        <!-- Audio Sample Player -->
+                        <div class="speaker-sample" x-show="hasSpeakerSample(speaker)">
+                            <button class="speaker-play-btn" 
+                                    @click="playSpeakerSample(speaker)"
+                                    :title="'Écouter un extrait de ' + speaker">
+                                <svg viewBox="0 0 24 24" fill="currentColor" stroke="none">
+                                    <polygon points="5 3 19 12 5 21 5 3"/>
+                                </svg>
+                            </button>
+                            <div class="speaker-sample-info">
+                                <span class="speaker-sample-duration" x-text="getSpeakerSampleDuration(speaker)"></span>
+                                <span class="speaker-sample-text" x-text="getSpeakerSampleText(speaker)"></span>
+                            </div>
+                        </div>
+                        
                         <div class="speaker-input-wrapper">
                             <input type="text" 
                                    class="speaker-name-input"
@@ -875,6 +893,6 @@
         </footer>
     </main>
     
-    <script src="/static/app.js?v=13"></script>
+    <script src="/static/app.js?v=15"></script>
 </body>
 </html>

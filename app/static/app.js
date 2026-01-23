@@ -41,6 +41,10 @@ function sttApp() {
         // Speaker naming
         detectedSpeakers: [],
         speakerNames: {},
+        speakerSamples: {},  // Speaker audio samples info
+        sessionId: null,     // Session ID for audio sample API
+        historyId: null,     // History record ID for speaker naming sync
+        clientId: null,      // Client ID for result recovery after disconnect
         originalResult: null,
         
         // Dictation state
@@ -199,12 +203,17 @@ function sttApp() {
             this.cancelRequested = false;
             this.useServerProgress = false;
             
+            // Generate unique client ID for result recovery
+            this.clientId = crypto.randomUUID();
+            console.log('Generated client ID:', this.clientId);
+            
             try {
                 // Prepare form data
                 const formData = new FormData();
                 formData.append('file', this.selectedFile);
                 formData.append('response_format', this.options.format);
                 formData.append('diarize', this.options.diarize);
+                formData.append('client_id', this.clientId);
                 
                 if (this.options.language) {
                     formData.append('language', this.options.language);
@@ -245,7 +254,9 @@ function sttApp() {
                     this.result = data;
                     
                     if (this.options.diarize) {
-                        this.extractSpeakers(null);
+                        // Use speaker metadata from SSE response for non-JSON formats
+                        const speakerMeta = response._speakerMeta || {};
+                        this.extractSpeakers(null, speakerMeta);
                         this.originalResult = this.result;
                     }
                 }
@@ -253,6 +264,9 @@ function sttApp() {
                 this.stopProgressSimulation();
                 this.progress = 100;
                 this.statusText = '✅ Terminé !';
+                
+                // Save state after successful transcription
+                this.saveState();
                 
             } catch (err) {
                 console.error('Transcription error:', err);
@@ -268,6 +282,8 @@ function sttApp() {
                 setTimeout(() => {
                     this.processing = false;
                     this.cancelRequested = false;
+                    // Save final state
+                    this.saveState();
                 }, 500);
             }
         },
@@ -325,18 +341,42 @@ function sttApp() {
                         } else if (result.content !== undefined) {
                             // Create Response-like object
                             const headers = new Headers();
-                            headers.set('content-type', result.format === 'json' ? 'application/json' : 'text/plain');
+                            const isJson = result.format === 'json';
+                            headers.set('content-type', isJson ? 'application/json' : 'text/plain');
+                            
+                            // Build data object - only parse as JSON if format is json
+                            let jsonData = null;
+                            if (isJson) {
+                                try {
+                                    jsonData = typeof result.content === 'string' ? JSON.parse(result.content) : result.content;
+                                    // Add speaker samples to JSON data
+                                    if (jsonData && typeof jsonData === 'object' && !Array.isArray(jsonData)) {
+                                        if (result.session_id) jsonData.session_id = result.session_id;
+                                        if (result.speaker_samples) jsonData.speaker_samples = result.speaker_samples;
+                                    }
+                                } catch (e) {
+                                    console.error('Failed to parse JSON content:', e);
+                                    jsonData = result.content;
+                                }
+                            } else {
+                                // For text/srt/vtt formats, content is plain text
+                                jsonData = result.content;
+                            }
                             
                             resolve({
                                 ok: true,
                                 status: 200,
                                 headers: headers,
-                                json: () => Promise.resolve(
-                                    typeof result.content === 'string' ? JSON.parse(result.content) : result.content
-                                ),
+                                json: () => isJson ? Promise.resolve(jsonData) : Promise.reject(new Error('Not JSON')),
                                 text: () => Promise.resolve(
                                     typeof result.content === 'string' ? result.content : JSON.stringify(result.content)
-                                )
+                                ),
+                                // Store metadata separately for non-JSON formats
+                                _speakerMeta: {
+                                    session_id: result.session_id,
+                                    speaker_samples: result.speaker_samples,
+                                    history_id: result.history_id
+                                }
                             });
                         } else {
                             reject(new Error('Réponse invalide du serveur'));
@@ -494,6 +534,17 @@ function sttApp() {
                         if (currentEvent === 'result') {
                             result.content = parsed.content;
                             result.format = parsed.format;
+                            // Extract speaker samples metadata
+                            if (parsed.session_id) {
+                                result.session_id = parsed.session_id;
+                            }
+                            if (parsed.speaker_samples) {
+                                result.speaker_samples = parsed.speaker_samples;
+                            }
+                            // Extract history ID for speaker naming sync
+                            if (parsed.history_id) {
+                                result.history_id = parsed.history_id;
+                            }
                         } else if (currentEvent === 'error') {
                             result.error = parsed.detail || 'Erreur inconnue';
                         } else if (currentEvent === 'cancelled') {
@@ -706,12 +757,24 @@ function sttApp() {
          * Clear result and start fresh
          */
         clearResult() {
+            // Cleanup speaker samples cache
+            this.cleanupSpeakerSamples();
+            
             this.result = null;
             this.resultMeta = null;
             this.originalResult = null;
             this.detectedSpeakers = [];
             this.speakerNames = {};
+            this.speakerSamples = {};
+            this.sessionId = null;
+            this.historyId = null;
+            this.llmResult = '';
+            this.llmLastPrompt = '';
+            this._restoredFileInfo = null;
             this.removeFile();
+            
+            // Clear saved state
+            this.clearSavedState();
         },
         
         /**
@@ -779,8 +842,10 @@ function sttApp() {
         
         /**
          * Extract unique speakers from result
+         * @param {Object} data - JSON response data (can be null for non-JSON formats)
+         * @param {Object} speakerMeta - Optional speaker metadata from SSE response
          */
-        extractSpeakers(data) {
+        extractSpeakers(data, speakerMeta = {}) {
             const speakers = new Set();
             
             // Try to extract from JSON segments
@@ -806,12 +871,122 @@ function sttApp() {
             this.detectedSpeakers.forEach(speaker => {
                 this.speakerNames[speaker] = '';
             });
+            
+            // Extract speaker samples info from response data or speakerMeta
+            const samples = data?.speaker_samples || speakerMeta.speaker_samples;
+            const sessionId = data?.session_id || speakerMeta.session_id;
+            const historyId = data?.history_id || speakerMeta.history_id;
+            
+            if (samples) {
+                this.speakerSamples = samples;
+                this.sessionId = sessionId;
+                console.log('Speaker samples available:', Object.keys(this.speakerSamples));
+            } else {
+                this.speakerSamples = {};
+                this.sessionId = null;
+            }
+            
+            // Store history ID for speaker naming sync
+            this.historyId = historyId || null;
+            if (historyId) {
+                console.log('History ID for speaker naming:', historyId);
+            }
+        },
+        
+        /**
+         * Get the audio sample URL for a speaker
+         */
+        getSpeakerSampleUrl(speaker) {
+            if (!this.sessionId || !this.speakerSamples[speaker]) {
+                return null;
+            }
+            return `/speaker-sample/${this.sessionId}/${speaker}`;
+        },
+        
+        /**
+         * Check if a speaker has an audio sample available
+         */
+        hasSpeakerSample(speaker) {
+            return this.sessionId && this.speakerSamples[speaker];
+        },
+        
+        /**
+         * Get the sample text preview for a speaker
+         */
+        getSpeakerSampleText(speaker) {
+            const sample = this.speakerSamples[speaker];
+            if (!sample || !sample.text) return '';
+            
+            // Truncate if too long
+            const text = sample.text;
+            if (text.length > 80) {
+                return text.substring(0, 77) + '...';
+            }
+            return text;
+        },
+        
+        /**
+         * Get the sample duration for a speaker
+         */
+        getSpeakerSampleDuration(speaker) {
+            const sample = this.speakerSamples[speaker];
+            if (!sample) return '';
+            return `${sample.duration}s`;
+        },
+        
+        /**
+         * Play a speaker's audio sample
+         */
+        playSpeakerSample(speaker) {
+            const url = this.getSpeakerSampleUrl(speaker);
+            if (!url) return;
+            
+            // Stop any currently playing audio
+            const existingAudio = document.querySelector('audio.speaker-audio-player');
+            if (existingAudio) {
+                existingAudio.pause();
+                existingAudio.remove();
+            }
+            
+            // Create and play new audio
+            const audio = new Audio(url);
+            audio.className = 'speaker-audio-player';
+            audio.style.display = 'none';
+            document.body.appendChild(audio);
+            
+            audio.play().catch(err => {
+                console.error('Failed to play speaker sample:', err);
+            });
+            
+            // Remove when finished
+            audio.addEventListener('ended', () => {
+                audio.remove();
+            });
+        },
+        
+        /**
+         * Cleanup speaker samples cache when done
+         */
+        async cleanupSpeakerSamples() {
+            if (!this.sessionId) return;
+            
+            try {
+                await fetch(`/speaker-samples/${this.sessionId}`, {
+                    method: 'DELETE'
+                });
+                console.log('Speaker samples cache cleaned up');
+            } catch (err) {
+                console.debug('Failed to cleanup speaker samples:', err);
+            }
+            
+            this.sessionId = null;
+            this.speakerSamples = {};
         },
         
         /**
          * Apply speaker names to transcription
          */
-        applySpeakerNames() {
+        async applySpeakerNames() {
             if (!this.originalResult) {
                 this.originalResult = this.result;
             }
@@ -829,6 +1004,28 @@ function sttApp() {
             });
             
             this.result = newResult;
+            
+            // Update history if we have a history ID
+            if (this.historyId && this.hasSpeakerNames()) {
+                try {
+                    const response = await fetch(`/history/${this.historyId}/speakers`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ speaker_names: this.speakerNames })
+                    });
+                    
+                    if (response.ok) {
+                        console.log('Speaker names saved to history');
+                    } else {
+                        console.warn('Failed to save speaker names to history');
+                    }
+                } catch (err) {
+                    console.warn('Failed to sync speaker names with history:', err);
+                }
+            }
+            
+            // Save state after applying names
+            this.saveState();
         },
         
         /**
@@ -1196,6 +1393,224 @@ function sttApp() {
             this.dictationError = null;
         },
         
+        // ===== STATE PERSISTENCE =====
+        
+        /**
+         * Save current state to sessionStorage for persistence across page refresh
+         */
+        saveState() {
+            const state = {
+                // Results
+                result: this.result,
+                resultMeta: this.resultMeta,
+                originalResult: this.originalResult,
+                
+                // Speaker data
+                detectedSpeakers: this.detectedSpeakers,
+                speakerNames: this.speakerNames,
+                speakerSamples: this.speakerSamples,
+                sessionId: this.sessionId,
+                historyId: this.historyId,
+                clientId: this.clientId,
+                
+                // Options
+                options: this.options,
+                
+                // File info (not the file itself)
+                selectedFileName: this.selectedFile?.name || null,
+                selectedFileSize: this.selectedFile?.size || null,
+                
+                // Progress state (if processing)
+                processing: this.processing,
+                progress: this.progress,
+                statusText: this.statusText,
+                
+                // LLM result
+                llmResult: this.llmResult,
+                llmLastPrompt: this.llmLastPrompt,
+                
+                // Dictation
+                dictationText: this.dictationText,
+                
+                // Tab
+                activeTab: this.activeTab,
+                
+                // Timestamp
+                savedAt: Date.now()
+            };
+            
+            try {
+                sessionStorage.setItem('mywhisper_state', JSON.stringify(state));
+            } catch (err) {
+                console.warn('Failed to save state:', err);
+            }
+        },
+        
+        /**
+         * Restore state from sessionStorage
+         */
+        restoreState() {
+            try {
+                const saved = sessionStorage.getItem('mywhisper_state');
+                if (!saved) return false;
+                
+                const state = JSON.parse(saved);
+                
+                // Check if state is too old (more than 4 hours)
+                const maxAge = 4 * 60 * 60 * 1000; // 4 hours in ms
+                if (Date.now() - state.savedAt > maxAge) {
+                    sessionStorage.removeItem('mywhisper_state');
+                    return false;
+                }
+                
+                // Restore results
+                if (state.result) {
+                    this.result = state.result;
+                    this.resultMeta = state.resultMeta;
+                    this.originalResult = state.originalResult;
+                }
+                
+                // Restore speaker data
+                if (state.detectedSpeakers?.length > 0) {
+                    this.detectedSpeakers = state.detectedSpeakers;
+                    this.speakerNames = state.speakerNames || {};
+                    this.speakerSamples = state.speakerSamples || {};
+                    this.sessionId = state.sessionId;
+                    this.historyId = state.historyId;
+                }
+                
+                // Restore client ID for result recovery
+                if (state.clientId) {
+                    this.clientId = state.clientId;
+                }
+                
+                // Restore options
+                if (state.options) {
+                    this.options = { ...this.options, ...state.options };
+                }
+                
+                // Restore file info (display only, not actual file)
+                if (state.selectedFileName) {
+                    // Create a fake file object for display purposes
+                    this._restoredFileInfo = {
+                        name: state.selectedFileName,
+                        size: state.selectedFileSize
+                    };
+                }
+                
+                // Restore LLM result
+                if (state.llmResult) {
+                    this.llmResult = state.llmResult;
+                    this.llmLastPrompt = state.llmLastPrompt || '';
+                }
+                
+                // Restore dictation text
+                if (state.dictationText) {
+                    this.dictationText = state.dictationText;
+                }
+                
+                // Restore tab
+                if (state.activeTab) {
+                    this.activeTab = state.activeTab;
+                }
+                
+                // If was processing, restore the processing state immediately
+                // This prevents the "server busy" message from appearing on refresh
+                if (state.processing) {
+                    this.processing = true;  // Set this immediately!
+                    this.statusText = state.statusText || 'Reprise en cours...';
+                    this.progress = state.progress || 0;
+                    this.useServerProgress = true;
+                }
+                
+                console.log('State restored from sessionStorage');
+                return true;
+                
+            } catch (err) {
+                console.warn('Failed to restore state:', err);
+                sessionStorage.removeItem('mywhisper_state');
+                return false;
+            }
+        },
+        
+        /**
+         * Clear saved state
+         */
+        clearSavedState() {
+            sessionStorage.removeItem('mywhisper_state');
+        },
+        
+        /**
+         * Get restored file info for display (when actual file is not available)
+         */
+        getFileDisplayInfo() {
+            if (this.selectedFile) {
+                return {
+                    name: this.selectedFile.name,
+                    size: this.selectedFile.size
+                };
+            }
+            return this._restoredFileInfo || null;
+        },
+        
+        /**
+         * Restore speaker samples on server after page refresh.
+         * If the server was restarted, it might have lost the speaker samples metadata
+         * but the audio file might still exist.
+         */
+        async restoreSpeakerSamplesOnServer() {
+            if (!this.sessionId || !this.speakerSamples || Object.keys(this.speakerSamples).length === 0) {
+                return;
+            }
+            
+            try {
+                // First check if samples are available on server
+                const checkResponse = await fetch(`/speaker-samples/${this.sessionId}`);
+                
+                if (checkResponse.ok) {
+                    const data = await checkResponse.json();
+                    // Check if server has the samples or just the file
+                    if (!data.speaker_samples || Object.keys(data.speaker_samples).length === 0) {
+                        // Server has file but no samples, restore them
+                        await this.doRestoreSpeakerSamples();
+                    } else {
+                        console.log('Speaker samples already available on server');
+                    }
+                } else if (checkResponse.status === 404) {
+                    // Session not found - try to restore
+                    await this.doRestoreSpeakerSamples();
+                }
+            } catch (err) {
+                console.warn('Failed to check/restore speaker samples on server:', err);
+            }
+        },
+        
+        /**
+         * Actually send the restore request to server
+         */
+        async doRestoreSpeakerSamples() {
+            try {
+                const response = await fetch(`/speaker-samples/${this.sessionId}/restore`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ speaker_samples: this.speakerSamples })
+                });
+                
+                if (response.ok) {
+                    console.log('Speaker samples restored on server');
+                } else {
+                    // Audio file expired or not found
+                    console.warn('Could not restore speaker samples - audio file may have expired');
+                    // Clear the sample data since it's not usable
+                    this.speakerSamples = {};
+                    this.sessionId = null;
+                    this.saveState();
+                }
+            } catch (err) {
+                console.warn('Failed to restore speaker samples:', err);
+            }
+        },
+        
         // ===== OLLAMA FUNCTIONS =====
         
         /**
@@ -1207,11 +1622,126 @@ function sttApp() {
             this.loadServerSettings();
             // Check Ollama status from backend (configured via .env)
             this.checkOllamaStatus();
-            // Check server status immediately and periodically
-            this.checkServerStatus();
+            
+            // Restore state from sessionStorage (before checking server status)
+            const stateRestored = this.restoreState();
+            
+            // If state was restored with speaker samples, ensure they're available on server
+            if (stateRestored && this.sessionId && Object.keys(this.speakerSamples).length > 0) {
+                this.restoreSpeakerSamplesOnServer();
+            }
+            
+            // Check server status immediately
+            this.checkServerStatus().then(() => {
+                // If server is processing and we have restored state, resume tracking
+                if (stateRestored && this.serverProcessing.is_processing && this.processing) {
+                    // We were processing before refresh, resume progress tracking
+                    console.log('Resuming progress tracking after refresh...');
+                    this.resumeProgressTracking();
+                } else if (stateRestored && !this.serverProcessing.is_processing && this.processing) {
+                    // Server is not processing anymore but we thought we were processing
+                    console.log('Server finished while we were away, recovering result...');
+                    
+                    if (this.result) {
+                        // We have a result - show completed state
+                        this.processing = false;
+                        this.progress = 100;
+                        this.statusText = '✅ Terminé !';
+                    } else {
+                        // No result - automatically fetch from history
+                        this.fetchResultFromHistory();
+                    }
+                }
+            });
+            
+            // Check server status periodically
             this.statusCheckInterval = setInterval(() => {
                 this.checkServerStatus();
             }, 2000); // Check every 2 seconds
+            
+            // Save state periodically and on important changes
+            setInterval(() => {
+                if (this.result || this.processing || this.dictationText) {
+                    this.saveState();
+                }
+            }, 5000); // Save every 5 seconds if there's something to save
+            
+            // Save state before page unload
+            window.addEventListener('beforeunload', () => {
+                this.saveState();
+            });
+        },
+        
+        /**
+         * Try to recover result from history when connection was lost during processing
+         */
+        async tryRecoverFromHistory() {
+            console.log('Trying to recover result from history...');
+            
+            try {
+                // Get the most recent history item
+                const response = await fetch('/history?limit=1&offset=0');
+                if (!response.ok) {
+                    throw new Error('Failed to fetch history');
+                }
+                
+                const data = await response.json();
+                
+                if (data.transcriptions && data.transcriptions.length > 0) {
+                    const lastItem = data.transcriptions[0];
+                    
+                    // Check if it was created recently (within last 30 minutes)
+                    const createdAt = new Date(lastItem.created_at);
+                    const now = new Date();
+                    const ageMinutes = (now - createdAt) / (1000 * 60);
+                    
+                    if (ageMinutes < 30) {
+                        // Recent transcription found - offer to view it
+                        this.progress = 100;
+                        this.statusText = '✅ Terminé ! Résultat disponible dans l\'historique';
+                        this._recoveredHistoryId = lastItem.id;
+                        
+                        // Show notification and switch to history
+                        setTimeout(() => {
+                            if (confirm(`Le traitement a terminé pendant le rafraîchissement.\n\nFichier: ${lastItem.filename}\nLocuteurs: ${lastItem.speakers_count || 'N/A'}\n\nVoulez-vous voir le résultat dans l'historique ?`)) {
+                                this.activeTab = 'history';
+                                this.loadHistory();
+                                this.viewHistoryItem(lastItem);
+                            }
+                            // Clear the stale state
+                            this.clearSavedState();
+                        }, 500);
+                        
+                        return;
+                    }
+                }
+                
+                // No recent result found - clear stale state
+                this.progress = 0;
+                this.statusText = '';
+                this.clearSavedState();
+                console.log('No recent history found - cleared stale state');
+                
+            } catch (err) {
+                console.warn('Failed to recover from history:', err);
+                this.progress = 0;
+                this.statusText = '';
+                this.clearSavedState();
+            }
+        },
+        
+        /**
+         * Resume progress tracking after page refresh
+         */
+        resumeProgressTracking() {
+            console.log('Resuming progress tracking...');
+            this.useServerProgress = true;
+            
+            // Update from server status
+            if (this.serverProcessing.progress_percent > 0) {
+                this.progress = this.serverProcessing.progress_percent;
+            }
+            this.updateStatusFromServer(this.serverProcessing);
         },
         
         /**
@@ -1266,6 +1796,7 @@ function sttApp() {
                 const response = await fetch('/status');
                 if (response.ok) {
                     const status = await response.json();
+                    const wasProcessing = this.serverProcessing.is_processing;
                     this.serverProcessing = status;
                     
                     // Update progress from server if we're processing and server has progress info
@@ -1274,10 +1805,158 @@ function sttApp() {
                         this.progress = status.progress_percent;
                         this.updateStatusFromServer(status);
                     }
+                    
+                    // Detect when server finishes processing (transition from true to false)
+                    // and we're still showing processing state but don't have a result
+                    if (wasProcessing && !status.is_processing && this.processing && !this.result) {
+                        console.log('Server finished processing - fetching result from history');
+                        this.fetchResultFromHistory();
+                    }
                 }
             } catch (err) {
                 // Silent fail - server might be busy
                 console.debug('Status check failed:', err);
+            }
+        },
+        
+        /**
+         * Fetch the result using client ID cache or history as fallback
+         */
+        async fetchResultFromHistory() {
+            this.statusText = '📥 Récupération du résultat...';
+            console.log('Attempting to recover result...');
+            
+            try {
+                // First, try to get result from server cache using client ID
+                if (this.clientId) {
+                    console.log('Trying to recover with client ID:', this.clientId);
+                    const cacheResponse = await fetch(`/result/${this.clientId}`);
+                    
+                    if (cacheResponse.ok) {
+                        const cached = await cacheResponse.json();
+                        
+                        if (cached.status === 'completed') {
+                            console.log('Result recovered from server cache!');
+                            
+                            // Set the result
+                            const result = cached.result;
+                            this.result = cached.format === 'json' 
+                                ? JSON.stringify(cached.content, null, 2)
+                                : cached.content;
+                            
+                            this.resultMeta = {
+                                language: result?.language,
+                                duration: result?.duration
+                            };
+                            this.historyId = cached.history_id;
+                            
+                            // Extract speakers if diarization was enabled
+                            if (result?.segments && result.segments.some(s => s.speaker)) {
+                                this.extractSpeakers(result);
+                                this.originalResult = this.result;
+                            }
+                            
+                            this.processing = false;
+                            this.progress = 100;
+                            this.statusText = '✅ Terminé ! (récupéré)';
+                            this.clientId = null; // Clear client ID after use
+                            this.saveState();
+                            
+                            return;
+                        } else if (cached.status === 'processing') {
+                            console.log('Server still processing, resuming tracking...');
+                            this.resumeProgressTracking();
+                            return;
+                        }
+                    } else if (cacheResponse.status !== 404) {
+                        console.warn('Unexpected response from cache:', cacheResponse.status);
+                    }
+                }
+                
+                // Fallback: Get result from history
+                console.log('Falling back to history...');
+                const response = await fetch('/history?limit=5&offset=0');
+                if (!response.ok) throw new Error('Failed to fetch history');
+                
+                const data = await response.json();
+                
+                if (data.transcriptions && data.transcriptions.length > 0) {
+                    // Get the file name we were processing
+                    const expectedFileName = this.getFileDisplayInfo()?.name;
+                    console.log('Looking for file:', expectedFileName);
+                    
+                    // Find a matching recent transcription
+                    let bestMatch = null;
+                    
+                    for (const item of data.transcriptions) {
+                        const createdAt = new Date(item.created_at);
+                        const now = new Date();
+                        const ageMinutes = (now - createdAt) / (1000 * 60);
+                        
+                        // Must be recent (within last 30 minutes)
+                        if (ageMinutes > 30) continue;
+                        
+                        // If we know the filename, prefer exact match
+                        if (expectedFileName && item.filename === expectedFileName) {
+                            bestMatch = item;
+                            console.log('Found exact filename match:', item.id, item.filename);
+                            break;
+                        }
+                        
+                        // Otherwise take the most recent one (first in list)
+                        if (!bestMatch && ageMinutes < 5) {
+                            bestMatch = item;
+                            console.log('Found recent item:', item.id, item.filename);
+                        }
+                    }
+                    
+                    if (bestMatch) {
+                        // Fetch full result
+                        const fullResponse = await fetch(`/history/${bestMatch.id}`);
+                        if (fullResponse.ok) {
+                            const fullItem = await fullResponse.json();
+                            
+                            // Set the result
+                            this.result = fullItem.result_text;
+                            this.resultMeta = {
+                                language: fullItem.language,
+                                duration: fullItem.audio_duration
+                            };
+                            this.historyId = fullItem.id;
+                            
+                            // Extract speakers if diarization was enabled
+                            if (fullItem.diarization && fullItem.result_json) {
+                                this.extractSpeakers(fullItem.result_json);
+                                this.originalResult = this.result;
+                            }
+                            
+                            this.processing = false;
+                            this.progress = 100;
+                            this.statusText = '✅ Terminé ! (récupéré de l\'historique)';
+                            this.clientId = null;
+                            this.saveState();
+                            
+                            console.log('Result recovered from history:', bestMatch.id);
+                            return;
+                        }
+                    }
+                }
+                
+                // Fallback - no recent result found
+                console.warn('No matching result found');
+                this.processing = false;
+                this.progress = 0;
+                this.statusText = '⚠️ Résultat non trouvé - vérifiez l\'historique';
+                this.clientId = null;
+                this.clearSavedState();
+                
+            } catch (err) {
+                console.error('Failed to recover result:', err);
+                this.processing = false;
+                this.progress = 0;
+                this.statusText = '⚠️ Erreur de récupération';
+                this.clientId = null;
+                this.clearSavedState();
             }
         },
         

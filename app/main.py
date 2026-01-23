@@ -15,7 +15,7 @@ import time
 import math
 from threading import Thread
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -37,7 +37,8 @@ from app.utils import (
     sanitize_filename,
     segments_to_srt,
     segments_to_vtt,
-    segments_to_text
+    segments_to_text,
+    select_speaker_samples
 )
 
 # Configure logging
@@ -46,6 +47,221 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AudioFileCache:
+    """
+    Temporary cache for audio files to enable speaker sample extraction.
+    Files are kept for a duration matching frontend state persistence
+    to allow the frontend to request speaker audio samples after page refresh.
+    """
+    _cache: Dict[str, Dict[str, Any]] = None
+    _lock: asyncio.Lock = None
+    CACHE_DURATION_SECONDS: int = 14400  # 4 hours (matches frontend sessionStorage)
+    
+    def __post_init__(self):
+        if self._cache is None:
+            object.__setattr__(self, '_cache', {})
+        if self._lock is None:
+            object.__setattr__(self, '_lock', asyncio.Lock())
+    
+    def store(self, session_id: str, file_path: str, speaker_samples: Dict[str, Any]) -> None:
+        """Store audio file path and speaker samples for a session."""
+        self._cache[session_id] = {
+            "file_path": file_path,
+            "speaker_samples": speaker_samples,
+            "created_at": datetime.now()
+        }
+        logger.info(f"Cached audio file for session {session_id}: {file_path}")
+    
+    def get(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Get cached audio info for a session."""
+        if session_id not in self._cache:
+            # Try to recover from file if it exists (e.g., after server restart)
+            return self._try_recover_from_file(session_id)
+        
+        entry = self._cache[session_id]
+        # Check if expired
+        age = (datetime.now() - entry["created_at"]).total_seconds()
+        if age > self.CACHE_DURATION_SECONDS:
+            self.remove(session_id)
+            return None
+        
+        return entry
+    
+    def _try_recover_from_file(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Try to recover cache entry from existing file on disk.
+        This helps after server restart when frontend still has the session_id.
+        """
+        # Check common extensions for cached files
+        for ext in ['.mp3', '.wav', '.m4a', '.webm', '.mp4', '.flac', '.ogg']:
+            cache_path = Path(settings.UPLOAD_DIR) / f"cache_{session_id}{ext}"
+            if cache_path.exists():
+                # Check file age
+                file_age = (datetime.now() - datetime.fromtimestamp(cache_path.stat().st_mtime)).total_seconds()
+                if file_age < self.CACHE_DURATION_SECONDS:
+                    logger.info(f"Recovered audio cache from file: {cache_path}")
+                    # Re-add to memory cache (without speaker_samples - they'll need to be provided)
+                    self._cache[session_id] = {
+                        "file_path": str(cache_path),
+                        "speaker_samples": {},  # Will be populated by restore endpoint
+                        "created_at": datetime.fromtimestamp(cache_path.stat().st_mtime)
+                    }
+                    return self._cache[session_id]
+                else:
+                    # File too old, clean it up
+                    try:
+                        os.remove(cache_path)
+                        logger.info(f"Cleaned up expired cache file: {cache_path}")
+                    except Exception:
+                        pass
+        return None
+    
+    def restore_speaker_samples(self, session_id: str, speaker_samples: Dict[str, Any]) -> bool:
+        """
+        Restore speaker samples for a recovered cache entry.
+        Called when frontend provides the speaker_samples after page refresh.
+        """
+        if session_id in self._cache:
+            self._cache[session_id]["speaker_samples"] = speaker_samples
+            return True
+        return False
+    
+    def remove(self, session_id: str) -> None:
+        """Remove cached audio file and clean up."""
+        if session_id in self._cache:
+            entry = self._cache.pop(session_id)
+            file_path = entry.get("file_path")
+            if file_path and Path(file_path).exists():
+                try:
+                    os.remove(file_path)
+                    logger.info(f"Cleaned up cached audio file: {file_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to clean up cached audio: {e}")
+    
+    def cleanup_expired(self) -> None:
+        """Remove all expired cache entries."""
+        now = datetime.now()
+        expired = []
+        for session_id, entry in self._cache.items():
+            age = (now - entry["created_at"]).total_seconds()
+            if age > self.CACHE_DURATION_SECONDS:
+                expired.append(session_id)
+        
+        for session_id in expired:
+            self.remove(session_id)
+        
+        if expired:
+            logger.info(f"Cleaned up {len(expired)} expired audio cache entries")
+    
+    def cleanup_disk_cache(self) -> int:
+        """
+        Clean up expired cache files from disk.
+        This handles files that may have been left behind after server restart
+        or that are older than the cache duration.
+        
+        Returns:
+            Number of files cleaned up
+        """
+        upload_dir = Path(settings.UPLOAD_DIR)
+        if not upload_dir.exists():
+            return 0
+        
+        cleaned = 0
+        now = datetime.now()
+        
+        # Find all cache files
+        for cache_file in upload_dir.glob("cache_*"):
+            try:
+                # Check file age
+                file_mtime = datetime.fromtimestamp(cache_file.stat().st_mtime)
+                age = (now - file_mtime).total_seconds()
+                
+                if age > self.CACHE_DURATION_SECONDS:
+                    # Extract session_id from filename
+                    session_id = cache_file.stem.replace("cache_", "")
+                    
+                    # Remove from memory cache if present
+                    if session_id in self._cache:
+                        del self._cache[session_id]
+                    
+                    # Delete file
+                    cache_file.unlink()
+                    cleaned += 1
+                    logger.debug(f"Cleaned up expired cache file: {cache_file.name}")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to clean up cache file {cache_file}: {e}")
+        
+        if cleaned > 0:
+            logger.info(f"Cleaned up {cleaned} expired audio cache files from disk")
+        
+        return cleaned
+
+
+# Global audio cache
+audio_cache = AudioFileCache()
+
+
+@dataclass
+class ResultCache:
+    """
+    Cache for transcription results to allow clients to recover after disconnect.
+    When a client disconnects during processing, they can retrieve the result
+    using their client_id when they reconnect.
+    """
+    _cache: Dict[str, Dict[str, Any]] = None
+    CACHE_DURATION_SECONDS: int = 1800  # 30 minutes
+    
+    def __post_init__(self):
+        if self._cache is None:
+            object.__setattr__(self, '_cache', {})
+    
+    def store(self, client_id: str, result: Dict[str, Any]) -> None:
+        """Store a transcription result for a client."""
+        self._cache[client_id] = {
+            "result": result,
+            "created_at": datetime.now()
+        }
+        logger.info(f"Cached result for client {client_id}")
+    
+    def get(self, client_id: str) -> Optional[Dict[str, Any]]:
+        """Get cached result for a client, if still valid."""
+        if client_id not in self._cache:
+            return None
+        
+        entry = self._cache[client_id]
+        age = (datetime.now() - entry["created_at"]).total_seconds()
+        
+        if age > self.CACHE_DURATION_SECONDS:
+            del self._cache[client_id]
+            return None
+        
+        return entry["result"]
+    
+    def remove(self, client_id: str) -> None:
+        """Remove cached result for a client."""
+        if client_id in self._cache:
+            del self._cache[client_id]
+            logger.info(f"Removed cached result for client {client_id}")
+    
+    def cleanup_expired(self) -> None:
+        """Remove all expired cache entries."""
+        now = datetime.now()
+        expired = [
+            cid for cid, entry in self._cache.items()
+            if (now - entry["created_at"]).total_seconds() > self.CACHE_DURATION_SECONDS
+        ]
+        for cid in expired:
+            del self._cache[cid]
+        if expired:
+            logger.info(f"Cleaned up {len(expired)} expired result cache entries")
+
+
+# Global result cache
+result_cache = ResultCache()
 
 
 @dataclass
@@ -60,6 +276,7 @@ class ProcessingState:
     processing_type: Optional[str] = None  # 'file' or 'dictation'
     cancel_requested: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    client_id: Optional[str] = None  # Client ID for result recovery
     
     # Progress tracking
     current_step: str = "idle"  # 'uploading', 'transcribing', 'diarizing', 'finalizing'
@@ -68,13 +285,14 @@ class ProcessingState:
     current_chunk: int = 0
     audio_duration: float = 0.0
     
-    def start(self, filename: str, processing_type: str = "file"):
+    def start(self, filename: str, processing_type: str = "file", client_id: str = None):
         """Mark processing as started"""
         self.is_processing = True
         self.current_file = filename
         self.started_at = datetime.now()
         self.processing_type = processing_type
         self.cancel_requested = False
+        self.client_id = client_id
         self.current_step = "uploading"
         self.progress_percent = 0
         self.total_chunks = 0
@@ -88,6 +306,7 @@ class ProcessingState:
         self.started_at = None
         self.processing_type = None
         self.cancel_requested = False
+        self.client_id = None
         self.current_step = "idle"
         self.progress_percent = 0
         self.total_chunks = 0
@@ -131,12 +350,24 @@ class ProcessingState:
             "progress_percent": self.progress_percent,
             "total_chunks": self.total_chunks,
             "current_chunk": self.current_chunk,
-            "audio_duration": self.audio_duration
+            "audio_duration": self.audio_duration,
+            "client_id": self.client_id
         }
 
 
 # Global processing state
 processing_state = ProcessingState()
+
+
+async def periodic_cache_cleanup():
+    """Background task to periodically clean up expired cache files."""
+    while True:
+        await asyncio.sleep(1800)  # Run every 30 minutes
+        try:
+            audio_cache.cleanup_expired()
+            audio_cache.cleanup_disk_cache()
+        except Exception as e:
+            logger.warning(f"Cache cleanup error: {e}")
 
 
 @asynccontextmanager
@@ -151,6 +382,11 @@ async def lifespan(app: FastAPI):
     Path(settings.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
     Path(settings.OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
     Path(settings.MODEL_DIR).mkdir(parents=True, exist_ok=True)
+    
+    # Clean up old cache files from previous runs
+    cleaned = audio_cache.cleanup_disk_cache()
+    if cleaned > 0:
+        logger.info(f"🧹 Cleaned up {cleaned} old cache files at startup")
     
     # Pre-load Whisper model
     logger.info("Loading Whisper model (this may take a moment)...")
@@ -171,9 +407,20 @@ async def lifespan(app: FastAPI):
     logger.info(f"📡 API: http://{settings.HOST}:{settings.PORT}")
     logger.info("=" * 50)
     
+    # Start background cache cleanup task
+    cleanup_task = asyncio.create_task(periodic_cache_cleanup())
+    
     yield
     
     # Shutdown
+    cleanup_task.cancel()
+    try:
+        await cleanup_task
+    except asyncio.CancelledError:
+        pass
+    
+    # Final cleanup
+    audio_cache.cleanup_disk_cache()
     logger.info("Shutting down Whisper STT Service...")
 
 
@@ -268,6 +515,45 @@ async def cancel_processing():
     }
 
 
+@app.get("/result/{client_id}")
+async def get_cached_result(client_id: str):
+    """
+    Retrieve a cached transcription result by client ID.
+    
+    This endpoint allows clients to recover their transcription result
+    after a disconnect (e.g., page refresh during processing).
+    
+    The result is cached for 30 minutes after processing completes.
+    """
+    cached = result_cache.get(client_id)
+    
+    if cached is None:
+        # Check if this client is currently processing
+        if processing_state.is_processing and processing_state.client_id == client_id:
+            return {
+                "status": "processing",
+                "message": "Transcription still in progress",
+                "progress": processing_state.get_status()
+            }
+        
+        raise HTTPException(
+            status_code=404,
+            detail="No cached result found for this client ID. The result may have expired or processing may not have completed."
+        )
+    
+    # Remove from cache after retrieval (one-time use)
+    result_cache.remove(client_id)
+    
+    return {
+        "status": "completed",
+        "content": cached["content"],
+        "format": cached["format"],
+        "result": cached["result"],
+        "filename": cached["filename"],
+        "history_id": cached.get("history_id")
+    }
+
+
 @app.get("/v1/models")
 @app.get("/models")
 async def list_models():
@@ -343,7 +629,8 @@ async def transcribe_audio_stream(
     diarize: bool = Form(False),
     min_speakers: Optional[int] = Form(None),
     max_speakers: Optional[int] = Form(None),
-    processing_type: str = Form("file")
+    processing_type: str = Form("file"),
+    client_id: Optional[str] = Form(None)
 ):
     """
     SSE streaming transcription endpoint that prevents 504 timeout errors.
@@ -358,7 +645,7 @@ async def transcribe_audio_stream(
     """
     return await _process_transcription_stream(
         file, language, response_format, diarize, 
-        min_speakers, max_speakers, processing_type
+        min_speakers, max_speakers, processing_type, client_id
     )
 
 
@@ -369,7 +656,8 @@ async def _process_transcription_stream(
     diarize: bool,
     min_speakers: Optional[int] = None,
     max_speakers: Optional[int] = None,
-    processing_type: str = "file"
+    processing_type: str = "file",
+    client_id: Optional[str] = None
 ):
     """
     Process transcription with SSE streaming to prevent proxy timeouts.
@@ -459,7 +747,7 @@ async def _process_transcription_stream(
         
         try:
             # Mark processing as started
-            processing_state.start(filename, processing_type)
+            processing_state.start(filename, processing_type, client_id=client_id)
             
             # Save to temp file
             safe_filename = sanitize_filename(filename)
@@ -561,6 +849,29 @@ async def _process_transcription_stream(
                         result["segments"],
                         include_speakers=True
                     )
+                    
+                    # Generate speaker samples for audio preview
+                    # Pass diarization timeline for confidence scoring
+                    speaker_samples = select_speaker_samples(
+                        result["segments"],
+                        diarization_timeline=timeline
+                    )
+                    if speaker_samples:
+                        # Generate a session ID for this transcription
+                        session_id = str(uuid.uuid4())
+                        result["session_id"] = session_id
+                        result["speaker_samples"] = speaker_samples
+                        
+                        # Cache the audio file for sample extraction
+                        # Move temp file to a more persistent location
+                        cache_path = Path(settings.UPLOAD_DIR) / f"cache_{session_id}{temp_path.suffix}"
+                        try:
+                            import shutil
+                            shutil.copy(str(temp_path), str(cache_path))
+                            audio_cache.store(session_id, str(cache_path), speaker_samples)
+                            logger.info(f"Cached audio for speaker samples: {session_id}")
+                        except Exception as e:
+                            logger.warning(f"Failed to cache audio for samples: {e}")
                 else:
                     logger.warning("Diarization requested but not available")
             
@@ -586,7 +897,7 @@ async def _process_transcription_stream(
                     
                     processing_duration = round(time.time() - processing_start_time, 2)
                     
-                    history.save_transcription(
+                    history_id = history.save_transcription(
                         filename=filename,
                         file_size=file_size,
                         audio_duration=result.get("duration", 0),
@@ -599,10 +910,24 @@ async def _process_transcription_stream(
                         result_json=result,
                         processing_duration=processing_duration
                     )
+                    # Store history ID in result for frontend
+                    result["history_id"] = history_id
                 except Exception as e:
                     logger.warning(f"Failed to save to history: {e}")
             
-            result_queue.put(("success", result_content, response_format))
+            # Cache result for client recovery after disconnect
+            if client_id:
+                cache_result = {
+                    "content": result_content,
+                    "format": response_format,
+                    "result": result,
+                    "filename": filename,
+                    "history_id": result.get("history_id")
+                }
+                result_cache.store(client_id, cache_result)
+                logger.info(f"Result cached for client {client_id}")
+            
+            result_queue.put(("success", result_content, response_format, result))
             
         except Exception as e:
             logger.error(f"Transcription error (stream): {e}")
@@ -658,15 +983,24 @@ async def _process_transcription_stream(
             if result[0] == "success":
                 result_content = result[1]
                 fmt = result[2]
+                full_result = result[3] if len(result) > 3 else {}
                 
                 # Send final progress
                 yield f"event: progress\ndata: {json.dumps({'step': 'complete', 'percent': 100})}\n\n"
                 
-                # Send result based on format
-                if isinstance(result_content, str):
-                    yield f"event: result\ndata: {json.dumps({'format': fmt, 'content': result_content})}\n\n"
-                else:
-                    yield f"event: result\ndata: {json.dumps({'format': fmt, 'content': result_content})}\n\n"
+                # Build result event with speaker samples if available
+                result_event = {'format': fmt, 'content': result_content}
+                
+                # Include speaker samples metadata for diarization
+                if full_result.get('session_id'):
+                    result_event['session_id'] = full_result['session_id']
+                if full_result.get('speaker_samples'):
+                    result_event['speaker_samples'] = full_result['speaker_samples']
+                # Include history ID for speaker naming sync
+                if full_result.get('history_id'):
+                    result_event['history_id'] = full_result['history_id']
+                
+                yield f"event: result\ndata: {json.dumps(result_event)}\n\n"
                     
             elif result[0] == "cancelled":
                 yield f"event: cancelled\ndata: {json.dumps({'message': result[1]})}\n\n"
@@ -884,6 +1218,28 @@ async def _process_transcription(
                         result["segments"],
                         include_speakers=True
                     )
+                    
+                    # Generate speaker samples for audio preview
+                    # Pass diarization timeline for confidence scoring
+                    speaker_samples = select_speaker_samples(
+                        result["segments"],
+                        diarization_timeline=timeline
+                    )
+                    if speaker_samples:
+                        # Generate a session ID for this transcription
+                        session_id = str(uuid.uuid4())
+                        result["session_id"] = session_id
+                        result["speaker_samples"] = speaker_samples
+                        
+                        # Cache the audio file for sample extraction
+                        cache_path = Path(settings.UPLOAD_DIR) / f"cache_{session_id}{temp_path.suffix}"
+                        try:
+                            import shutil
+                            shutil.copy(str(temp_path), str(cache_path))
+                            audio_cache.store(session_id, str(cache_path), speaker_samples)
+                            logger.info(f"Cached audio for speaker samples: {session_id}")
+                        except Exception as e:
+                            logger.warning(f"Failed to cache audio for samples: {e}")
                 else:
                     logger.warning("Diarization requested but not available")
             
@@ -901,6 +1257,7 @@ async def _process_transcription(
                 result_content = result
             
             # Save to history (only for file transcriptions, not dictation)
+            history_id = None
             if processing_type == "file":
                 try:
                     speakers_count = 0
@@ -910,7 +1267,7 @@ async def _process_transcription(
                     
                     processing_duration = round(time.time() - processing_start_time, 2)
                     
-                    history.save_transcription(
+                    history_id = history.save_transcription(
                         filename=filename,
                         file_size=file_size,
                         audio_duration=result.get("duration", 0),
@@ -923,6 +1280,7 @@ async def _process_transcription(
                         result_json=result,
                         processing_duration=processing_duration
                     )
+                    result["history_id"] = history_id
                 except Exception as e:
                     logger.warning(f"Failed to save to history: {e}")
             
@@ -930,7 +1288,8 @@ async def _process_transcription(
                 "success": True,
                 "result": result,
                 "result_content": result_content,
-                "format": response_format
+                "format": response_format,
+                "history_id": history_id
             }
             
         except Exception as e:
@@ -967,6 +1326,170 @@ async def _process_transcription(
         return PlainTextResponse(content=result_content, media_type="text/vtt")
     else:
         return JSONResponse(content=result_content)
+
+
+# ============================================
+# Speaker Audio Sample Endpoints
+# ============================================
+
+@app.get("/speaker-sample/{session_id}/{speaker_id}")
+async def get_speaker_sample(session_id: str, speaker_id: str):
+    """
+    Extract and serve an audio sample for a specific speaker.
+    
+    This endpoint extracts a short audio clip from the cached audio file
+    that corresponds to the best sample for the given speaker.
+    
+    Args:
+        session_id: The transcription session ID
+        speaker_id: The speaker identifier (e.g., SPEAKER_00)
+        
+    Returns:
+        Audio file (WAV format) containing the speaker sample
+    """
+    import subprocess
+    import tempfile
+    
+    # Get cached audio info
+    cache_entry = audio_cache.get(session_id)
+    if not cache_entry:
+        raise HTTPException(status_code=404, detail="Session expirée ou introuvable")
+    
+    file_path = cache_entry.get("file_path")
+    speaker_samples = cache_entry.get("speaker_samples", {})
+    
+    if not file_path or not Path(file_path).exists():
+        raise HTTPException(status_code=404, detail="Fichier audio introuvable")
+    
+    if speaker_id not in speaker_samples:
+        raise HTTPException(status_code=404, detail=f"Pas d'extrait disponible pour {speaker_id}")
+    
+    sample_info = speaker_samples[speaker_id]
+    start_time = sample_info["start"]
+    end_time = sample_info["end"]
+    duration = end_time - start_time
+    
+    # Create temporary file for the extracted sample
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
+        output_path = tmp_file.name
+    
+    try:
+        # Use ffmpeg to extract the audio segment
+        cmd = [
+            "ffmpeg",
+            "-y",  # Overwrite output
+            "-i", str(file_path),
+            "-ss", str(start_time),
+            "-t", str(duration),
+            "-acodec", "pcm_s16le",  # WAV format
+            "-ar", "16000",  # 16kHz sample rate
+            "-ac", "1",  # Mono
+            output_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, timeout=30)
+        
+        if result.returncode != 0:
+            logger.error(f"FFmpeg error: {result.stderr.decode()}")
+            raise HTTPException(status_code=500, detail="Erreur lors de l'extraction audio")
+        
+        # Read the extracted audio
+        async with aiofiles.open(output_path, 'rb') as f:
+            audio_data = await f.read()
+        
+        # Return as streaming response
+        return StreamingResponse(
+            iter([audio_data]),
+            media_type="audio/wav",
+            headers={
+                "Content-Disposition": f'inline; filename="{speaker_id}_sample.wav"',
+                "Cache-Control": "max-age=300"  # Cache for 5 minutes
+            }
+        )
+        
+    except subprocess.TimeoutExpired:
+        logger.error("FFmpeg timeout during audio extraction")
+        raise HTTPException(status_code=500, detail="Timeout lors de l'extraction")
+    except Exception as e:
+        logger.error(f"Audio extraction error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Clean up temp file
+        if Path(output_path).exists():
+            try:
+                os.remove(output_path)
+            except:
+                pass
+
+
+@app.get("/speaker-samples/{session_id}")
+async def get_session_speaker_samples(session_id: str):
+    """
+    Get the list of available speaker samples for a session.
+    
+    Args:
+        session_id: The transcription session ID
+        
+    Returns:
+        Dict with speaker samples info
+    """
+    cache_entry = audio_cache.get(session_id)
+    if not cache_entry:
+        raise HTTPException(status_code=404, detail="Session expirée ou introuvable")
+    
+    return {
+        "session_id": session_id,
+        "speaker_samples": cache_entry.get("speaker_samples", {}),
+        "expires_in_seconds": max(0, audio_cache.CACHE_DURATION_SECONDS - 
+            (datetime.now() - cache_entry["created_at"]).total_seconds())
+    }
+
+
+class RestoreSpeakerSamplesRequest(BaseModel):
+    speaker_samples: Dict[str, Any]
+
+
+@app.post("/speaker-samples/{session_id}/restore")
+async def restore_speaker_samples(session_id: str, request: RestoreSpeakerSamplesRequest):
+    """
+    Restore speaker samples metadata for a session.
+    Used after page refresh when the frontend has the samples but the server cache was lost.
+    
+    Args:
+        session_id: The transcription session ID
+        request: The speaker samples to restore
+        
+    Returns:
+        Success status
+    """
+    # First check if the audio file still exists (might have been recovered)
+    cache_entry = audio_cache.get(session_id)
+    
+    if cache_entry:
+        # Cache entry exists (recovered from file), restore the speaker samples
+        audio_cache.restore_speaker_samples(session_id, request.speaker_samples)
+        return {
+            "success": True, 
+            "message": "Speaker samples restored",
+            "expires_in_seconds": max(0, audio_cache.CACHE_DURATION_SECONDS - 
+                (datetime.now() - cache_entry["created_at"]).total_seconds())
+        }
+    else:
+        # No cache entry and file not found
+        raise HTTPException(status_code=404, detail="Session expirée ou fichier audio introuvable")
+
+
+@app.delete("/speaker-samples/{session_id}")
+async def cleanup_session_audio(session_id: str):
+    """
+    Manually cleanup audio cache for a session.
+    Called when user is done with speaker naming.
+    
+    Args:
+        session_id: The transcription session ID
+    """
+    audio_cache.remove(session_id)
+    return {"success": True, "message": "Cache nettoyé"}
 
 
 # ============================================
@@ -1084,6 +1607,37 @@ async def delete_history_record(record_id: int):
         raise HTTPException(status_code=404, detail="Transcription not found")
     
     return {"success": True, "message": "Transcription deleted"}
+
+
+class SpeakerNamesRequest(BaseModel):
+    speaker_names: Dict[str, str]
+
+
+@app.put("/history/{record_id}/speakers")
+async def update_history_speakers(record_id: int, request: SpeakerNamesRequest):
+    """
+    Update speaker names in a transcription record.
+    Replaces SPEAKER_XX with the provided names.
+    
+    Args:
+        record_id: The transcription ID
+        request: Dict mapping speaker IDs to names (e.g., {"SPEAKER_00": "Jean"})
+        
+    Returns:
+        Success message
+    """
+    # Filter out empty names
+    speaker_names = {k: v for k, v in request.speaker_names.items() if v and v.strip()}
+    
+    if not speaker_names:
+        raise HTTPException(status_code=400, detail="Aucun nom de locuteur fourni")
+    
+    updated = history.update_speaker_names(record_id, speaker_names)
+    
+    if not updated:
+        raise HTTPException(status_code=404, detail="Transcription not found")
+    
+    return {"success": True, "message": "Speaker names updated", "updated_speakers": list(speaker_names.keys())}
 
 
 # ============================================

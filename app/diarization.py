@@ -422,7 +422,8 @@ class SpeakerDiarizer:
                     all_segments.append({
                         "start": round(abs_start, 3),
                         "end": round(abs_end, 3),
-                        "speaker": speaker
+                        "speaker": speaker,
+                        "chunk_id": chunk_num  # Track which chunk this came from
                     })
                 
                 # Clean up chunk data
@@ -460,15 +461,156 @@ class SpeakerDiarizer:
     def _harmonize_speakers(self, segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Harmonize speaker labels across chunks.
-        Ensures consistent speaker IDs throughout the audio.
+        Ensures consistent speaker IDs throughout the audio by mapping
+        speaker IDs from different chunks to a unified set.
+        
+        Strategy:
+        1. Group segments by chunk
+        2. For consecutive chunks, find temporal overlaps to map speakers
+        3. Build a global speaker mapping
+        4. Apply the mapping to all segments
         """
         if not segments:
             return segments
         
-        # For now, just return as-is
-        # A more sophisticated approach would track speaker embeddings
-        # and merge similar speakers across chunks
-        return segments
+        # Check if we have chunk info (single-pass processing won't have it)
+        if not any("chunk_id" in seg for seg in segments):
+            return segments
+        
+        # Group segments by chunk
+        chunks: Dict[int, List[Dict[str, Any]]] = {}
+        for seg in segments:
+            chunk_id = seg.get("chunk_id", 0)
+            if chunk_id not in chunks:
+                chunks[chunk_id] = []
+            chunks[chunk_id].append(seg)
+        
+        # If only one chunk, no harmonization needed
+        if len(chunks) <= 1:
+            # Remove chunk_id from output
+            return [{k: v for k, v in seg.items() if k != "chunk_id"} for seg in segments]
+        
+        # Build speaker mapping across chunks
+        # global_mapping[chunk_id][local_speaker] = global_speaker
+        global_mapping: Dict[int, Dict[str, str]] = {}
+        next_global_speaker_id = 0
+        global_speakers: Dict[str, int] = {}  # Maps speaker characteristics to global ID
+        
+        chunk_ids = sorted(chunks.keys())
+        
+        for i, chunk_id in enumerate(chunk_ids):
+            chunk_segs = chunks[chunk_id]
+            local_speakers = set(seg["speaker"] for seg in chunk_segs)
+            
+            if i == 0:
+                # First chunk: assign global IDs directly
+                global_mapping[chunk_id] = {}
+                for speaker in sorted(local_speakers):
+                    global_name = f"SPEAKER_{next_global_speaker_id:02d}"
+                    global_mapping[chunk_id][speaker] = global_name
+                    next_global_speaker_id += 1
+            else:
+                # Subsequent chunks: map to previous chunk's speakers based on timing
+                prev_chunk_id = chunk_ids[i - 1]
+                prev_segs = chunks[prev_chunk_id]
+                
+                # Find the overlap region (last 30s of prev chunk, first 30s of current)
+                if prev_segs and chunk_segs:
+                    prev_end_time = max(seg["end"] for seg in prev_segs)
+                    curr_start_time = min(seg["start"] for seg in chunk_segs)
+                    
+                    # Get speakers active near the boundary
+                    # Look at last 60 seconds of previous chunk
+                    prev_boundary_segs = [
+                        seg for seg in prev_segs 
+                        if seg["end"] > prev_end_time - 60
+                    ]
+                    # Look at first 60 seconds of current chunk
+                    curr_boundary_segs = [
+                        seg for seg in chunk_segs 
+                        if seg["start"] < curr_start_time + 60
+                    ]
+                    
+                    # Calculate overlap between speakers
+                    speaker_overlaps: Dict[str, Dict[str, float]] = {}
+                    
+                    for curr_seg in curr_boundary_segs:
+                        curr_speaker = curr_seg["speaker"]
+                        if curr_speaker not in speaker_overlaps:
+                            speaker_overlaps[curr_speaker] = {}
+                        
+                        for prev_seg in prev_boundary_segs:
+                            prev_speaker = prev_seg["speaker"]
+                            
+                            # Calculate temporal proximity (not overlap, but closeness)
+                            # Speakers that follow each other closely are likely the same
+                            time_gap = abs(curr_seg["start"] - prev_seg["end"])
+                            
+                            if time_gap < 30:  # Within 30 seconds
+                                # Weight by inverse of time gap
+                                weight = 1.0 / (1.0 + time_gap)
+                                prev_global = global_mapping[prev_chunk_id].get(prev_speaker)
+                                if prev_global:
+                                    if prev_global not in speaker_overlaps[curr_speaker]:
+                                        speaker_overlaps[curr_speaker][prev_global] = 0
+                                    speaker_overlaps[curr_speaker][prev_global] += weight
+                    
+                    # Map current speakers to global speakers
+                    global_mapping[chunk_id] = {}
+                    used_global_speakers = set()
+                    
+                    # Sort current speakers by their total overlap score (most confident first)
+                    sorted_speakers = sorted(
+                        local_speakers,
+                        key=lambda s: max(speaker_overlaps.get(s, {}).values(), default=0),
+                        reverse=True
+                    )
+                    
+                    for speaker in sorted_speakers:
+                        overlaps = speaker_overlaps.get(speaker, {})
+                        
+                        # Find best matching global speaker not yet used
+                        best_match = None
+                        best_score = 0
+                        
+                        for global_speaker, score in sorted(overlaps.items(), key=lambda x: -x[1]):
+                            if global_speaker not in used_global_speakers and score > best_score:
+                                best_match = global_speaker
+                                best_score = score
+                        
+                        if best_match and best_score > 0.1:
+                            # Use existing global speaker
+                            global_mapping[chunk_id][speaker] = best_match
+                            used_global_speakers.add(best_match)
+                        else:
+                            # New speaker, assign new global ID
+                            global_name = f"SPEAKER_{next_global_speaker_id:02d}"
+                            global_mapping[chunk_id][speaker] = global_name
+                            next_global_speaker_id += 1
+                            used_global_speakers.add(global_name)
+        
+        # Apply mapping to all segments
+        harmonized = []
+        for seg in segments:
+            chunk_id = seg.get("chunk_id", 0)
+            local_speaker = seg["speaker"]
+            
+            # Get global speaker name
+            if chunk_id in global_mapping and local_speaker in global_mapping[chunk_id]:
+                global_speaker = global_mapping[chunk_id][local_speaker]
+            else:
+                global_speaker = local_speaker
+            
+            # Create new segment without chunk_id
+            new_seg = {k: v for k, v in seg.items() if k != "chunk_id"}
+            new_seg["speaker"] = global_speaker
+            harmonized.append(new_seg)
+        
+        # Log mapping info
+        unique_speakers = set(seg["speaker"] for seg in harmonized)
+        logger.info(f"Harmonized speakers across {len(chunks)} chunks: {len(unique_speakers)} unique speakers")
+        
+        return harmonized
     
     def merge_with_transcription(
         self,
