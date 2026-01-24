@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>MyWhisper - Transcription Audio</title>
-    <link rel="stylesheet" href="/static/styles.css?v=11">
+    <link rel="stylesheet" href="/static/styles.css?v=12">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -310,6 +310,14 @@
                             <span class="speaker-badge" x-text="speaker"></span>
                         </div>
                         
+                        <div class="speaker-input-wrapper">
+                            <input type="text" 
+                                   class="speaker-name-input"
+                                   :placeholder="`Nom de ${speaker}`"
+                                   x-model="speakerNames[speaker]"
+                                   @keyup.enter="applySpeakerNames()">
+                        </div>
+                        
                         <!-- Audio Sample Player -->
                         <div class="speaker-sample" x-show="hasSpeakerSample(speaker)">
                             <button class="speaker-play-btn" 
@@ -323,14 +331,6 @@
                                 <span class="speaker-sample-duration" x-text="getSpeakerSampleDuration(speaker)"></span>
                                 <span class="speaker-sample-text" x-text="getSpeakerSampleText(speaker)"></span>
                             </div>
-                        </div>
-                        
-                        <div class="speaker-input-wrapper">
-                            <input type="text" 
-                                   class="speaker-name-input"
-                                   :placeholder="`Nom de ${speaker}`"
-                                   x-model="speakerNames[speaker]"
-                                   @keyup.enter="applySpeakerNames()">
                         </div>
                     </div>
                 </template>
@@ -893,6 +893,6 @@
         </footer>
     </main>
     
-    <script src="/static/app.js?v=15"></script>
+    <script src="/static/app.js?v=16"></script>
 </body>
 </html>

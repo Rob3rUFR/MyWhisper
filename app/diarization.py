@@ -466,9 +466,10 @@ class SpeakerDiarizer:
         
         Strategy:
         1. Group segments by chunk
-        2. For consecutive chunks, find temporal overlaps to map speakers
-        3. Build a global speaker mapping
-        4. Apply the mapping to all segments
+        2. Maintain a GLOBAL history of all speakers with their temporal patterns
+        3. For each new chunk, compare with ALL known global speakers (not just previous chunk)
+        4. Use multiple criteria: temporal continuity, speaking patterns, position in conversation
+        5. Merge similar speakers that may have been incorrectly split
         """
         if not segments:
             return segments
@@ -494,13 +495,21 @@ class SpeakerDiarizer:
         # global_mapping[chunk_id][local_speaker] = global_speaker
         global_mapping: Dict[int, Dict[str, str]] = {}
         next_global_speaker_id = 0
-        global_speakers: Dict[str, int] = {}  # Maps speaker characteristics to global ID
+        
+        # Track ALL segments for each global speaker (for better matching)
+        # global_speaker_history[global_name] = [(start, end, chunk_id), ...]
+        global_speaker_history: Dict[str, List[tuple]] = {}
         
         chunk_ids = sorted(chunks.keys())
         
         for i, chunk_id in enumerate(chunk_ids):
             chunk_segs = chunks[chunk_id]
             local_speakers = set(seg["speaker"] for seg in chunk_segs)
+            chunk_start_time = min(seg["start"] for seg in chunk_segs) if chunk_segs else 0
+            chunk_end_time = max(seg["end"] for seg in chunk_segs) if chunk_segs else 0
+            
+            logger.debug(f"Processing chunk {chunk_id}: {len(local_speakers)} local speakers, "
+                        f"time range {chunk_start_time:.1f}s - {chunk_end_time:.1f}s")
             
             if i == 0:
                 # First chunk: assign global IDs directly
@@ -508,86 +517,130 @@ class SpeakerDiarizer:
                 for speaker in sorted(local_speakers):
                     global_name = f"SPEAKER_{next_global_speaker_id:02d}"
                     global_mapping[chunk_id][speaker] = global_name
+                    
+                    # Initialize history for this global speaker
+                    global_speaker_history[global_name] = [
+                        (seg["start"], seg["end"], chunk_id)
+                        for seg in chunk_segs if seg["speaker"] == speaker
+                    ]
                     next_global_speaker_id += 1
+                    
+                logger.debug(f"Chunk {chunk_id} (first): mapped {len(local_speakers)} speakers")
             else:
-                # Subsequent chunks: map to previous chunk's speakers based on timing
-                prev_chunk_id = chunk_ids[i - 1]
-                prev_segs = chunks[prev_chunk_id]
+                # Subsequent chunks: compare with ALL known global speakers
+                global_mapping[chunk_id] = {}
                 
-                # Find the overlap region (last 30s of prev chunk, first 30s of current)
-                if prev_segs and chunk_segs:
-                    prev_end_time = max(seg["end"] for seg in prev_segs)
-                    curr_start_time = min(seg["start"] for seg in chunk_segs)
+                # Calculate matching scores for each local speaker against all global speakers
+                speaker_scores: Dict[str, Dict[str, float]] = {}
+                
+                for local_speaker in local_speakers:
+                    local_segs = [seg for seg in chunk_segs if seg["speaker"] == local_speaker]
+                    if not local_segs:
+                        continue
                     
-                    # Get speakers active near the boundary
-                    # Look at last 60 seconds of previous chunk
-                    prev_boundary_segs = [
-                        seg for seg in prev_segs 
-                        if seg["end"] > prev_end_time - 60
-                    ]
-                    # Look at first 60 seconds of current chunk
-                    curr_boundary_segs = [
-                        seg for seg in chunk_segs 
-                        if seg["start"] < curr_start_time + 60
-                    ]
+                    local_start = min(seg["start"] for seg in local_segs)
+                    local_end = max(seg["end"] for seg in local_segs)
+                    local_total_duration = sum(seg["end"] - seg["start"] for seg in local_segs)
                     
-                    # Calculate overlap between speakers
-                    speaker_overlaps: Dict[str, Dict[str, float]] = {}
+                    speaker_scores[local_speaker] = {}
                     
-                    for curr_seg in curr_boundary_segs:
-                        curr_speaker = curr_seg["speaker"]
-                        if curr_speaker not in speaker_overlaps:
-                            speaker_overlaps[curr_speaker] = {}
+                    for global_name, history in global_speaker_history.items():
+                        if not history:
+                            continue
                         
-                        for prev_seg in prev_boundary_segs:
-                            prev_speaker = prev_seg["speaker"]
-                            
-                            # Calculate temporal proximity (not overlap, but closeness)
-                            # Speakers that follow each other closely are likely the same
-                            time_gap = abs(curr_seg["start"] - prev_seg["end"])
-                            
-                            if time_gap < 30:  # Within 30 seconds
-                                # Weight by inverse of time gap
-                                weight = 1.0 / (1.0 + time_gap)
-                                prev_global = global_mapping[prev_chunk_id].get(prev_speaker)
-                                if prev_global:
-                                    if prev_global not in speaker_overlaps[curr_speaker]:
-                                        speaker_overlaps[curr_speaker][prev_global] = 0
-                                    speaker_overlaps[curr_speaker][prev_global] += weight
-                    
-                    # Map current speakers to global speakers
-                    global_mapping[chunk_id] = {}
-                    used_global_speakers = set()
-                    
-                    # Sort current speakers by their total overlap score (most confident first)
-                    sorted_speakers = sorted(
-                        local_speakers,
-                        key=lambda s: max(speaker_overlaps.get(s, {}).values(), default=0),
-                        reverse=True
-                    )
-                    
-                    for speaker in sorted_speakers:
-                        overlaps = speaker_overlaps.get(speaker, {})
+                        # Score 1: Temporal continuity (how close is last appearance)
+                        last_appearance = max(end for start, end, cid in history)
+                        time_gap = local_start - last_appearance
                         
-                        # Find best matching global speaker not yet used
-                        best_match = None
-                        best_score = 0
-                        
-                        for global_speaker, score in sorted(overlaps.items(), key=lambda x: -x[1]):
-                            if global_speaker not in used_global_speakers and score > best_score:
-                                best_match = global_speaker
-                                best_score = score
-                        
-                        if best_match and best_score > 0.1:
-                            # Use existing global speaker
-                            global_mapping[chunk_id][speaker] = best_match
-                            used_global_speakers.add(best_match)
+                        # Penalize large gaps, but don't completely reject
+                        if time_gap < 0:
+                            # Overlapping - strong positive signal
+                            continuity_score = 2.0
+                        elif time_gap < 5:
+                            # Very close - strong match
+                            continuity_score = 1.5
+                        elif time_gap < 30:
+                            # Close - good match
+                            continuity_score = 1.0 / (1.0 + time_gap / 10.0)
+                        elif time_gap < 120:
+                            # Medium gap - possible match
+                            continuity_score = 0.3 / (1.0 + time_gap / 30.0)
                         else:
-                            # New speaker, assign new global ID
-                            global_name = f"SPEAKER_{next_global_speaker_id:02d}"
-                            global_mapping[chunk_id][speaker] = global_name
-                            next_global_speaker_id += 1
-                            used_global_speakers.add(global_name)
+                            # Large gap - unlikely but not impossible
+                            continuity_score = 0.1 / (1.0 + time_gap / 60.0)
+                        
+                        # Score 2: Speaking pattern similarity (average segment duration)
+                        global_durations = [end - start for start, end, cid in history]
+                        global_avg_duration = sum(global_durations) / len(global_durations) if global_durations else 0
+                        local_avg_duration = local_total_duration / len(local_segs) if local_segs else 0
+                        
+                        if global_avg_duration > 0 and local_avg_duration > 0:
+                            duration_ratio = min(global_avg_duration, local_avg_duration) / max(global_avg_duration, local_avg_duration)
+                            pattern_score = duration_ratio * 0.3
+                        else:
+                            pattern_score = 0
+                        
+                        # Score 3: Recency bonus (prefer matching with recently active speakers)
+                        # Get the chunk of last appearance
+                        last_chunk = max(cid for start, end, cid in history)
+                        chunk_distance = chunk_id - last_chunk
+                        recency_score = 0.2 / (1.0 + chunk_distance)
+                        
+                        total_score = continuity_score + pattern_score + recency_score
+                        speaker_scores[local_speaker][global_name] = total_score
+                        
+                        logger.debug(f"  {local_speaker} vs {global_name}: "
+                                    f"cont={continuity_score:.3f} pat={pattern_score:.3f} "
+                                    f"rec={recency_score:.3f} total={total_score:.3f}")
+                
+                # Assign speakers using Hungarian-style greedy matching
+                # (assign highest score matches first, remove from candidates)
+                used_global_speakers = set()
+                
+                # Create list of all (local, global, score) tuples, sorted by score descending
+                all_matches = []
+                for local_speaker, global_scores in speaker_scores.items():
+                    for global_name, score in global_scores.items():
+                        all_matches.append((local_speaker, global_name, score))
+                
+                all_matches.sort(key=lambda x: -x[2])
+                
+                assigned_local = set()
+                for local_speaker, global_name, score in all_matches:
+                    if local_speaker in assigned_local:
+                        continue
+                    if global_name in used_global_speakers:
+                        continue
+                    
+                    # Threshold for accepting a match
+                    if score >= 0.15:  # Lowered threshold for better continuity
+                        global_mapping[chunk_id][local_speaker] = global_name
+                        used_global_speakers.add(global_name)
+                        assigned_local.add(local_speaker)
+                        
+                        # Update history
+                        for seg in chunk_segs:
+                            if seg["speaker"] == local_speaker:
+                                global_speaker_history[global_name].append(
+                                    (seg["start"], seg["end"], chunk_id)
+                                )
+                        
+                        logger.debug(f"Chunk {chunk_id}: {local_speaker} -> {global_name} (score={score:.3f})")
+                
+                # Assign new global IDs to unmatched speakers
+                for local_speaker in local_speakers:
+                    if local_speaker not in global_mapping[chunk_id]:
+                        global_name = f"SPEAKER_{next_global_speaker_id:02d}"
+                        global_mapping[chunk_id][local_speaker] = global_name
+                        
+                        # Initialize history
+                        global_speaker_history[global_name] = [
+                            (seg["start"], seg["end"], chunk_id)
+                            for seg in chunk_segs if seg["speaker"] == local_speaker
+                        ]
+                        next_global_speaker_id += 1
+                        
+                        logger.debug(f"Chunk {chunk_id}: {local_speaker} -> {global_name} (NEW)")
         
         # Apply mapping to all segments
         harmonized = []
@@ -606,11 +659,146 @@ class SpeakerDiarizer:
             new_seg["speaker"] = global_speaker
             harmonized.append(new_seg)
         
+        # POST-PROCESSING: Merge speakers that appear to be duplicates
+        # (e.g., SPEAKER_02 and SPEAKER_05 that never overlap and have similar patterns)
+        harmonized = self._merge_duplicate_speakers(harmonized)
+        
         # Log mapping info
         unique_speakers = set(seg["speaker"] for seg in harmonized)
         logger.info(f"Harmonized speakers across {len(chunks)} chunks: {len(unique_speakers)} unique speakers")
         
         return harmonized
+    
+    def _merge_duplicate_speakers(self, segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Post-processing step to merge speakers that were incorrectly split.
+        
+        Identifies speakers that:
+        1. Never overlap temporally (can't be different people)
+        2. Have similar speaking patterns
+        3. One "disappears" when the other "appears"
+        """
+        if not segments:
+            return segments
+        
+        # Group segments by speaker
+        speaker_segments: Dict[str, List[Dict[str, Any]]] = {}
+        for seg in segments:
+            speaker = seg["speaker"]
+            if speaker not in speaker_segments:
+                speaker_segments[speaker] = []
+            speaker_segments[speaker].append(seg)
+        
+        speakers = list(speaker_segments.keys())
+        if len(speakers) <= 1:
+            return segments
+        
+        # Calculate overlap and adjacency between all speaker pairs
+        merge_candidates: List[tuple] = []
+        
+        for i, speaker_a in enumerate(speakers):
+            segs_a = speaker_segments[speaker_a]
+            for speaker_b in speakers[i+1:]:
+                segs_b = speaker_segments[speaker_b]
+                
+                # Check for temporal overlap
+                has_overlap = False
+                for sa in segs_a:
+                    for sb in segs_b:
+                        # Check if segments overlap
+                        if not (sa["end"] <= sb["start"] or sb["end"] <= sa["start"]):
+                            has_overlap = True
+                            break
+                    if has_overlap:
+                        break
+                
+                if has_overlap:
+                    # Speakers overlap - definitely different people
+                    continue
+                
+                # Check if one speaker "replaces" the other
+                # (speaker A's last segment is close to speaker B's first segment)
+                a_times = [(seg["start"], seg["end"]) for seg in segs_a]
+                b_times = [(seg["start"], seg["end"]) for seg in segs_b]
+                
+                a_last_end = max(end for start, end in a_times)
+                b_first_start = min(start for start, end in b_times)
+                a_first_start = min(start for start, end in a_times)
+                b_last_end = max(end for start, end in b_times)
+                
+                # Check if A ends and B starts, or B ends and A starts
+                gap_a_to_b = b_first_start - a_last_end if b_first_start > a_last_end else float('inf')
+                gap_b_to_a = a_first_start - b_last_end if a_first_start > b_last_end else float('inf')
+                
+                min_gap = min(gap_a_to_b, gap_b_to_a)
+                
+                # If one speaker completely follows the other with small gap
+                # and neither overlaps with the other, they might be the same
+                if min_gap < 60 and min_gap >= 0:
+                    # Calculate duration similarity
+                    a_total = sum(end - start for start, end in a_times)
+                    b_total = sum(end - start for start, end in b_times)
+                    
+                    # Don't merge if one is very short (likely just a mis-detection)
+                    if a_total < 5 or b_total < 5:
+                        continue
+                    
+                    # Calculate a merge score
+                    gap_score = 1.0 / (1.0 + min_gap / 10.0)
+                    
+                    # Prefer merging speakers with similar activity levels
+                    duration_ratio = min(a_total, b_total) / max(a_total, b_total)
+                    
+                    merge_score = gap_score * duration_ratio
+                    
+                    if merge_score > 0.3:
+                        merge_candidates.append((speaker_a, speaker_b, merge_score))
+                        logger.debug(f"Merge candidate: {speaker_a} + {speaker_b} (score={merge_score:.3f}, gap={min_gap:.1f}s)")
+        
+        # Apply merges (greedy, highest score first)
+        merge_candidates.sort(key=lambda x: -x[2])
+        
+        merge_map: Dict[str, str] = {}  # Maps speaker -> merged_speaker
+        
+        for speaker_a, speaker_b, score in merge_candidates:
+            # Find canonical names (following merge chains)
+            canonical_a = speaker_a
+            while canonical_a in merge_map:
+                canonical_a = merge_map[canonical_a]
+            
+            canonical_b = speaker_b
+            while canonical_b in merge_map:
+                canonical_b = merge_map[canonical_b]
+            
+            if canonical_a == canonical_b:
+                # Already merged
+                continue
+            
+            # Merge: keep the lower-numbered speaker
+            if canonical_a < canonical_b:
+                merge_map[canonical_b] = canonical_a
+                logger.info(f"Merging {canonical_b} into {canonical_a}")
+            else:
+                merge_map[canonical_a] = canonical_b
+                logger.info(f"Merging {canonical_a} into {canonical_b}")
+        
+        # Apply merges to segments
+        if merge_map:
+            merged_segments = []
+            for seg in segments:
+                new_seg = dict(seg)
+                speaker = seg["speaker"]
+                
+                # Follow merge chain
+                while speaker in merge_map:
+                    speaker = merge_map[speaker]
+                
+                new_seg["speaker"] = speaker
+                merged_segments.append(new_seg)
+            
+            return merged_segments
+        
+        return segments
     
     def merge_with_transcription(
         self,

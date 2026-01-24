@@ -1626,6 +1626,11 @@ function sttApp() {
             // Restore state from sessionStorage (before checking server status)
             const stateRestored = this.restoreState();
             
+            // If restored to history tab, load history immediately
+            if (this.activeTab === 'history') {
+                this.loadHistory();
+            }
+            
             // If state was restored with speaker samples, ensure they're available on server
             if (stateRestored && this.sessionId && Object.keys(this.speakerSamples).length > 0) {
                 this.restoreSpeakerSamplesOnServer();
