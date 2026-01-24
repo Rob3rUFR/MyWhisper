@@ -32,11 +32,16 @@ Conteneur Docker plug-and-play pour la transcription audio utilisant **Faster Wh
 - 📈 **Progression détaillée** - Suivi en temps réel de chaque étape
 - 💾 **Sauvegarde automatique** - Export direct vers un dossier de votre choix
 - 🔌 **API OpenAI-compatible** - Intégration directe avec Open WebUI
+- 🔄 **Persistance de l'état** - L'interface conserve son état après refresh
+- 📂 **Historique des transcriptions** - Gestion et téléchargement des anciennes transcriptions
+- 🎧 **Échantillons audio speakers** - Extrait audio pour identifier chaque intervenant
 
 ### Performance
 - 🚀 **GPU acceleration** - Optimisé CUDA avec TF32
 - 💪 **Support RTX 5090** - Compatible avec les derniers GPU NVIDIA
 - ⚡ **VAD intégré** - Filtrage automatique des silences
+- 🔗 **Fichiers longs** - Traitement par chunks avec harmonisation des speakers
+- 🔁 **Récupération auto** - Reprise après perte de connexion
 
 ## 🚀 Quick Start
 
@@ -98,10 +103,17 @@ Accéder à `http://localhost:8000` pour l'interface complète.
 4. La transcription apparaît en temps réel
 5. Arrêt automatique après 10s de silence ou clic sur "Arrêter"
 
+#### Onglet Historique
+1. Voir toutes les transcriptions passées
+2. Télécharger dans différents formats (Texte, JSON, SRT, VTT)
+3. Visualiser ou supprimer une transcription
+4. Configurer la durée de rétention dans les paramètres
+
 #### Onglet Paramètres
-1. Configurer l'URL Ollama (ex: `http://localhost:11434`)
-2. Sélectionner un modèle LLM
-3. Créer des prompts personnalisés avec `{text}` comme placeholder
+1. Configurer la durée de conservation de l'historique (1-365 jours)
+2. Configurer l'URL Ollama (ex: `http://localhost:11434`)
+3. Sélectionner un modèle LLM
+4. Créer des prompts personnalisés avec `{text}` comme placeholder
 
 ### API REST
 
@@ -146,6 +158,13 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions \
 | `POST /v1/audio/transcriptions` | Transcription OpenAI-compatible |
 | `POST /v1/audio/transcriptions/stream` | Transcription temps réel (dictée) |
 | `POST /transcribe` | Endpoint simplifié |
+| `GET /history` | Liste des transcriptions (pagination) |
+| `GET /history/{id}` | Détails d'une transcription |
+| `GET /history/{id}/download` | Télécharger (format: text/json/srt/vtt) |
+| `DELETE /history/{id}` | Supprimer une transcription |
+| `PUT /history/{id}/speakers` | Mettre à jour les noms des speakers |
+| `GET /speaker-sample/{session_id}/{speaker}` | Audio sample d'un speaker |
+| `GET /result/{client_id}` | Récupérer résultat après déconnexion |
 
 ## ⚙️ Configuration Open WebUI
 
@@ -185,6 +204,7 @@ networks:
 | `ENABLE_DIARIZATION` | `true` | Activer la diarisation |
 | `MAX_FILE_SIZE` | `524288000` | Taille max fichier (500MB) |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | URL de l'instance Ollama |
+| `HISTORY_RETENTION_DAYS` | `90` | Durée conservation historique (jours) |
 
 ### Optimisation GPU
 
@@ -217,12 +237,13 @@ MyWhisper/
 │   ├── main.py              # FastAPI app + routes
 │   ├── transcription.py     # Core STT logic (Faster Whisper)
 │   ├── diarization.py       # Speaker diarization (Pyannote)
+│   ├── history.py           # Gestion historique (SQLite)
 │   ├── patches.py           # Compatibility patches (PyTorch, torchaudio)
-│   ├── utils.py             # Helpers (formats, validation)
+│   ├── utils.py             # Helpers (formats, validation, speaker samples)
 │   ├── config.py            # Configuration (Pydantic)
 │   │
 │   └── static/
-│       ├── index.html       # Interface web (3 onglets)
+│       ├── index.html       # Interface web (4 onglets)
 │       ├── styles.css       # Dark theme moderne
 │       └── app.js           # Alpine.js app
 │
@@ -318,6 +339,22 @@ docker-compose restart
 ```
 
 ## 🆕 Changelog
+
+### v1.2.0 (Janvier 2026)
+- ✅ **Historique des transcriptions** - Conservation avec durée configurable
+- ✅ **Échantillons audio speakers** - Extrait audio pour identifier chaque intervenant
+- ✅ **Persistance de l'état** - L'interface conserve son état après refresh (sessionStorage)
+- ✅ **Récupération automatique** - Reprise des résultats après perte de connexion
+- ✅ **Harmonisation speakers** - Cohérence des IDs entre chunks pour fichiers longs (>10min)
+- ✅ **Anti-doublon échantillons** - Garantit des extraits audio uniques par speaker
+- ✅ **Verrouillage options** - Les options sont verrouillées pendant le traitement
+- ✅ **Amélioration UX** - Réorganisation interface speakers (ID → Input → Audio)
+
+### v1.1.0
+- ✅ Historique avec téléchargement multi-format
+- ✅ Sauvegarde des noms de speakers dans l'historique
+- ✅ Cache serveur pour récupération après déconnexion
+- ✅ Endpoint GET /result/{client_id}
 
 ### v1.0.0
 - ✅ Transcription Faster Whisper Large v3
