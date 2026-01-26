@@ -1,30 +1,15 @@
-FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+# Use NVIDIA NeMo official image - has pre-compiled extensions for latest GPUs
+FROM nvcr.io/nvidia/nemo:25.09.01
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PIP_NO_CACHE_DIR=1
 
-# Install system dependencies (rarely changes - cached)
+# Install additional system dependencies
 RUN apt-get update && apt-get install -y \
-    python3.11 \
-    python3.11-dev \
-    python3.11-venv \
-    python3-pip \
     ffmpeg \
-    git \
     curl \
-    build-essential \
-    pkg-config \
-    libavformat-dev \
-    libavcodec-dev \
-    libavdevice-dev \
-    libavutil-dev \
-    libswscale-dev \
-    libswresample-dev \
-    libavfilter-dev \
-    && rm -rf /var/lib/apt/lists/* \
-    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
-    && ln -sf /usr/bin/python3.11 /usr/bin/python
+    && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /app
@@ -32,15 +17,14 @@ WORKDIR /app
 # Create directories early (cached)
 RUN mkdir -p /app/uploads /app/outputs /app/models /app/app/static
 
-# Copy requirements and install dependencies (cached unless requirements.txt changes)
+# Copy requirements and install additional dependencies
 COPY requirements.txt .
-RUN pip3 install --upgrade pip && \
-    pip3 install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Copy Python files (changes less frequently than static files)
+# Copy Python files
 COPY app/*.py ./app/
 
-# Copy static files last (changes most frequently - only this layer rebuilds)
+# Copy static files
 COPY app/static/ ./app/static/
 
 # Expose port

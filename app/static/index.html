@@ -159,44 +159,6 @@
                 </select>
             </div>
             
-            <div class="option-group">
-                <label class="toggle-label" :class="{ 'toggle-disabled': processing }">
-                    <input type="checkbox" x-model="options.diarize" class="toggle-input" :disabled="processing">
-                    <span class="toggle-switch"></span>
-                    <span class="toggle-text">
-                        <span class="option-icon">👥</span>
-                        Diarisation
-                    </span>
-                </label>
-                <span class="option-hint">Identifier les intervenants</span>
-            </div>
-            
-            <!-- Speaker constraints (shown when diarization is enabled) -->
-            <div class="option-group speaker-options" x-show="options.diarize" x-transition>
-                <label class="option-label">
-                    <span class="option-icon">⚡</span>
-                    Nb. locuteurs (optionnel)
-                </label>
-                <div class="speaker-inputs">
-                    <input type="number" 
-                           x-model="options.minSpeakers" 
-                           class="number-input" 
-                           placeholder="Min"
-                           min="1" 
-                           max="20"
-                           :disabled="processing">
-                    <span class="speaker-separator">à</span>
-                    <input type="number" 
-                           x-model="options.maxSpeakers" 
-                           class="number-input" 
-                           placeholder="Max"
-                           min="1" 
-                           max="20"
-                           :disabled="processing">
-                </div>
-                <span class="option-hint">Accélère le traitement si connu</span>
-            </div>
-            
         </div>
         
         <!-- Server Busy Warning -->
@@ -250,13 +212,9 @@
                     <div class="step-dot"></div>
                     <span>Envoi</span>
                 </div>
-                <div class="progress-step" :class="{ 'active': progress >= 25, 'done': progress > 60 }">
+                <div class="progress-step" :class="{ 'active': progress >= 25, 'done': progress > 85 }">
                     <div class="step-dot"></div>
                     <span>Transcription</span>
-                </div>
-                <div class="progress-step" x-show="options.diarize" :class="{ 'active': progress >= 60, 'done': progress > 85 }">
-                    <div class="step-dot"></div>
-                    <span>Diarisation</span>
                 </div>
                 <div class="progress-step" :class="{ 'active': progress >= 85, 'done': progress >= 100 }">
                     <div class="step-dot"></div>
@@ -286,75 +244,6 @@
             </svg>
             <span x-text="error"></span>
             <button @click="error = null" class="error-close">×</button>
-        </div>
-        
-        <!-- Speakers Section (shown after diarization) -->
-        <div class="speakers-section" x-show="result && detectedSpeakers.length > 0" x-transition>
-            <div class="speakers-header">
-                <h3>
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
-                        <circle cx="9" cy="7" r="4"/>
-                        <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
-                        <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
-                    </svg>
-                    Intervenants détectés
-                </h3>
-                <span class="speakers-count" x-text="`${detectedSpeakers.length} intervenant${detectedSpeakers.length > 1 ? 's' : ''}`"></span>
-            </div>
-            
-            <div class="speakers-list">
-                <template x-for="speaker in detectedSpeakers" :key="speaker">
-                    <div class="speaker-item">
-                        <div class="speaker-id">
-                            <span class="speaker-badge" x-text="speaker"></span>
-                        </div>
-                        
-                        <div class="speaker-input-wrapper">
-                            <input type="text" 
-                                   class="speaker-name-input"
-                                   :placeholder="`Nom de ${speaker}`"
-                                   x-model="speakerNames[speaker]"
-                                   @keyup.enter="applySpeakerNames()">
-                        </div>
-                        
-                        <!-- Audio Sample Player -->
-                        <div class="speaker-sample" x-show="hasSpeakerSample(speaker)">
-                            <button class="speaker-play-btn" 
-                                    @click="playSpeakerSample(speaker)"
-                                    :title="'Écouter un extrait de ' + speaker">
-                                <svg viewBox="0 0 24 24" fill="currentColor" stroke="none">
-                                    <polygon points="5 3 19 12 5 21 5 3"/>
-                                </svg>
-                            </button>
-                            <div class="speaker-sample-info">
-                                <span class="speaker-sample-duration" x-text="getSpeakerSampleDuration(speaker)"></span>
-                                <span class="speaker-sample-text" x-text="getSpeakerSampleText(speaker)"></span>
-                            </div>
-                        </div>
-                    </div>
-                </template>
-            </div>
-            
-            <div class="speakers-actions">
-                <button class="action-btn primary" 
-                        @click="applySpeakerNames()"
-                        :disabled="!hasSpeakerNames()">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <polyline points="20 6 9 17 4 12"/>
-                    </svg>
-                    Appliquer les noms
-                </button>
-                <button class="action-btn secondary" 
-                        @click="resetSpeakerNames()"
-                        x-show="originalResult && result !== originalResult">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <polyline points="1 4 1 10 7 10"/>
-                        <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
-                    </svg>
-                    Réinitialiser
-                </button>
-            </div>
         </div>
         
         <!-- Results Section -->
@@ -889,7 +778,7 @@
         
         <!-- Footer -->
         <footer class="footer">
-            <p>Propulsé par <strong>Faster Whisper Large v3</strong> + <strong>NeMo Sortformer</strong></p>
+            <p>Propulsé par <strong>Faster Whisper Large v3</strong></p>
         </footer>
     </main>
     

@@ -30,15 +30,13 @@ import httpx
 
 from app.config import settings
 from app.transcription import transcriber
-from app.diarization import diarizer
 from app.history import history
 from app.utils import (
     validate_audio_file,
     sanitize_filename,
     segments_to_srt,
     segments_to_vtt,
-    segments_to_text,
-    select_speaker_samples
+    segments_to_text
 )
 
 # Configure logging
@@ -47,162 +45,6 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class AudioFileCache:
-    """
-    Temporary cache for audio files to enable speaker sample extraction.
-    Files are kept for a duration matching frontend state persistence
-    to allow the frontend to request speaker audio samples after page refresh.
-    """
-    _cache: Dict[str, Dict[str, Any]] = None
-    _lock: asyncio.Lock = None
-    CACHE_DURATION_SECONDS: int = 14400  # 4 hours (matches frontend sessionStorage)
-    
-    def __post_init__(self):
-        if self._cache is None:
-            object.__setattr__(self, '_cache', {})
-        if self._lock is None:
-            object.__setattr__(self, '_lock', asyncio.Lock())
-    
-    def store(self, session_id: str, file_path: str, speaker_samples: Dict[str, Any]) -> None:
-        """Store audio file path and speaker samples for a session."""
-        self._cache[session_id] = {
-            "file_path": file_path,
-            "speaker_samples": speaker_samples,
-            "created_at": datetime.now()
-        }
-        logger.info(f"Cached audio file for session {session_id}: {file_path}")
-    
-    def get(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """Get cached audio info for a session."""
-        if session_id not in self._cache:
-            # Try to recover from file if it exists (e.g., after server restart)
-            return self._try_recover_from_file(session_id)
-        
-        entry = self._cache[session_id]
-        # Check if expired
-        age = (datetime.now() - entry["created_at"]).total_seconds()
-        if age > self.CACHE_DURATION_SECONDS:
-            self.remove(session_id)
-            return None
-        
-        return entry
-    
-    def _try_recover_from_file(self, session_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Try to recover cache entry from existing file on disk.
-        This helps after server restart when frontend still has the session_id.
-        """
-        # Check common extensions for cached files
-        for ext in ['.mp3', '.wav', '.m4a', '.webm', '.mp4', '.flac', '.ogg']:
-            cache_path = Path(settings.UPLOAD_DIR) / f"cache_{session_id}{ext}"
-            if cache_path.exists():
-                # Check file age
-                file_age = (datetime.now() - datetime.fromtimestamp(cache_path.stat().st_mtime)).total_seconds()
-                if file_age < self.CACHE_DURATION_SECONDS:
-                    logger.info(f"Recovered audio cache from file: {cache_path}")
-                    # Re-add to memory cache (without speaker_samples - they'll need to be provided)
-                    self._cache[session_id] = {
-                        "file_path": str(cache_path),
-                        "speaker_samples": {},  # Will be populated by restore endpoint
-                        "created_at": datetime.fromtimestamp(cache_path.stat().st_mtime)
-                    }
-                    return self._cache[session_id]
-                else:
-                    # File too old, clean it up
-                    try:
-                        os.remove(cache_path)
-                        logger.info(f"Cleaned up expired cache file: {cache_path}")
-                    except Exception:
-                        pass
-        return None
-    
-    def restore_speaker_samples(self, session_id: str, speaker_samples: Dict[str, Any]) -> bool:
-        """
-        Restore speaker samples for a recovered cache entry.
-        Called when frontend provides the speaker_samples after page refresh.
-        """
-        if session_id in self._cache:
-            self._cache[session_id]["speaker_samples"] = speaker_samples
-            return True
-        return False
-    
-    def remove(self, session_id: str) -> None:
-        """Remove cached audio file and clean up."""
-        if session_id in self._cache:
-            entry = self._cache.pop(session_id)
-            file_path = entry.get("file_path")
-            if file_path and Path(file_path).exists():
-                try:
-                    os.remove(file_path)
-                    logger.info(f"Cleaned up cached audio file: {file_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to clean up cached audio: {e}")
-    
-    def cleanup_expired(self) -> None:
-        """Remove all expired cache entries."""
-        now = datetime.now()
-        expired = []
-        for session_id, entry in self._cache.items():
-            age = (now - entry["created_at"]).total_seconds()
-            if age > self.CACHE_DURATION_SECONDS:
-                expired.append(session_id)
-        
-        for session_id in expired:
-            self.remove(session_id)
-        
-        if expired:
-            logger.info(f"Cleaned up {len(expired)} expired audio cache entries")
-    
-    def cleanup_disk_cache(self) -> int:
-        """
-        Clean up expired cache files from disk.
-        This handles files that may have been left behind after server restart
-        or that are older than the cache duration.
-        
-        Returns:
-            Number of files cleaned up
-        """
-        upload_dir = Path(settings.UPLOAD_DIR)
-        if not upload_dir.exists():
-            return 0
-        
-        cleaned = 0
-        now = datetime.now()
-        
-        # Find all cache files
-        for cache_file in upload_dir.glob("cache_*"):
-            try:
-                # Check file age
-                file_mtime = datetime.fromtimestamp(cache_file.stat().st_mtime)
-                age = (now - file_mtime).total_seconds()
-                
-                if age > self.CACHE_DURATION_SECONDS:
-                    # Extract session_id from filename
-                    session_id = cache_file.stem.replace("cache_", "")
-                    
-                    # Remove from memory cache if present
-                    if session_id in self._cache:
-                        del self._cache[session_id]
-                    
-                    # Delete file
-                    cache_file.unlink()
-                    cleaned += 1
-                    logger.debug(f"Cleaned up expired cache file: {cache_file.name}")
-                    
-            except Exception as e:
-                logger.warning(f"Failed to clean up cache file {cache_file}: {e}")
-        
-        if cleaned > 0:
-            logger.info(f"Cleaned up {cleaned} expired audio cache files from disk")
-        
-        return cleaned
-
-
-# Global audio cache
-audio_cache = AudioFileCache()
 
 
 @dataclass
@@ -364,8 +206,7 @@ async def periodic_cache_cleanup():
     while True:
         await asyncio.sleep(1800)  # Run every 30 minutes
         try:
-            audio_cache.cleanup_expired()
-            audio_cache.cleanup_disk_cache()
+            result_cache.cleanup_expired()
         except Exception as e:
             logger.warning(f"Cache cleanup error: {e}")
 
@@ -383,11 +224,6 @@ async def lifespan(app: FastAPI):
     Path(settings.OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
     Path(settings.MODEL_DIR).mkdir(parents=True, exist_ok=True)
     
-    # Clean up old cache files from previous runs
-    cleaned = audio_cache.cleanup_disk_cache()
-    if cleaned > 0:
-        logger.info(f"🧹 Cleaned up {cleaned} old cache files at startup")
-    
     # Pre-load Whisper model
     logger.info("Loading Whisper model (this may take a moment)...")
     try:
@@ -395,12 +231,6 @@ async def lifespan(app: FastAPI):
         logger.info("✅ Whisper model ready")
     except Exception as e:
         logger.error(f"❌ Failed to load Whisper model: {e}")
-    
-    # Check diarization availability
-    if diarizer.is_available:
-        logger.info("✅ Diarization available")
-    else:
-        logger.warning("⚠️ Diarization unavailable (check ENABLE_DIARIZATION)")
     
     logger.info("=" * 50)
     logger.info("🚀 Service ready!")
@@ -419,8 +249,6 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
     
-    # Final cleanup
-    audio_cache.cleanup_disk_cache()
     logger.info("Shutting down Whisper STT Service...")
 
 
@@ -482,8 +310,7 @@ async def health_check():
         "gpu_available": gpu_available,
         "gpu_name": gpu_name,
         "gpu_memory_gb": gpu_memory,
-        "model": transcriber.get_model_info(),
-        "diarization": diarizer.get_info()
+        "model": transcriber.get_model_info()
     }
 
 
@@ -582,9 +409,6 @@ async def transcribe_audio_openai(
     model: str = Form("whisper-large-v3"),
     language: Optional[str] = Form(None),
     response_format: str = Form("json"),
-    diarize: bool = Form(False),
-    min_speakers: Optional[int] = Form(None),
-    max_speakers: Optional[int] = Form(None),
     processing_type: str = Form("file")
 ):
     """
@@ -595,29 +419,23 @@ async def transcribe_audio_openai(
         model: Model name (ignored, always uses configured model)
         language: Language code (e.g., 'fr', 'en'). None for auto-detection
         response_format: Output format - json, text, srt, vtt
-        diarize: Enable speaker diarization
-        min_speakers: Minimum number of speakers (optional, speeds up diarization)
-        max_speakers: Maximum number of speakers (optional, speeds up diarization)
         processing_type: Type of processing - 'file' (saved to history) or 'dictation' (not saved)
         
     Returns:
         Transcription in requested format
     """
-    return await _process_transcription(file, language, response_format, diarize, min_speakers, max_speakers, processing_type)
+    return await _process_transcription(file, language, response_format, processing_type)
 
 
 @app.post("/transcribe")
 async def simple_transcribe(
     file: UploadFile = File(...),
-    language: Optional[str] = Form(None),
-    diarize: bool = Form(False),
-    min_speakers: Optional[int] = Form(None),
-    max_speakers: Optional[int] = Form(None)
+    language: Optional[str] = Form(None)
 ):
     """
     Simplified transcription endpoint, always returns JSON.
     """
-    return await _process_transcription(file, language, "json", diarize, min_speakers, max_speakers)
+    return await _process_transcription(file, language, "json", "file")
 
 
 @app.post("/v1/audio/transcriptions/stream")
@@ -626,9 +444,6 @@ async def transcribe_audio_stream(
     model: str = Form("whisper-large-v3"),
     language: Optional[str] = Form(None),
     response_format: str = Form("json"),
-    diarize: bool = Form(False),
-    min_speakers: Optional[int] = Form(None),
-    max_speakers: Optional[int] = Form(None),
     processing_type: str = Form("file"),
     client_id: Optional[str] = Form(None)
 ):
@@ -644,8 +459,7 @@ async def transcribe_audio_stream(
         - error: Error message if processing fails
     """
     return await _process_transcription_stream(
-        file, language, response_format, diarize, 
-        min_speakers, max_speakers, processing_type, client_id
+        file, language, response_format, processing_type, client_id
     )
 
 
@@ -653,9 +467,6 @@ async def _process_transcription_stream(
     file: UploadFile,
     language: Optional[str],
     response_format: str,
-    diarize: bool,
-    min_speakers: Optional[int] = None,
-    max_speakers: Optional[int] = None,
     processing_type: str = "file",
     client_id: Optional[str] = None
 ):
@@ -705,7 +516,7 @@ async def _process_transcription_stream(
     # Flag to stop progress simulation
     stop_progress_simulation = {"value": False}
     
-    def simulate_transcription_progress(file_size_mb: float, has_diarize: bool):
+    def simulate_transcription_progress(file_size_mb: float):
         """
         Simulate progress during Whisper transcription.
         Whisper doesn't provide progress callbacks, so we estimate based on file size.
@@ -715,9 +526,9 @@ async def _process_transcription_stream(
         # Estimate processing time: ~1 minute per 10MB for transcription
         estimated_seconds = max(10, file_size_mb * 6)
         
-        # Progress range: 5% to 30% (with diarize) or 5% to 85% (without)
+        # Progress range: 5% to 85%
         start_percent = 5
-        end_percent = 28 if has_diarize else 85
+        end_percent = 85
         
         start_time = time_module.time()
         
@@ -770,7 +581,7 @@ async def _process_transcription_stream(
             stop_progress_simulation["value"] = False
             progress_thread = Thread(
                 target=simulate_transcription_progress,
-                args=(file_size_mb, diarize)
+                args=(file_size_mb,)
             )
             progress_thread.start()
             
@@ -789,91 +600,13 @@ async def _process_transcription_stream(
             audio_duration = result.get("duration", 0)
             processing_state.update_progress(
                 "transcribing", 
-                percent=30 if diarize else 90,
+                percent=90,
                 audio_duration=audio_duration
             )
             
             if processing_state.cancel_requested:
                 result_queue.put(("cancelled", "Traitement annulé par l'utilisateur"))
                 return
-            
-            # Diarization if requested
-            if diarize:
-                if diarizer.is_available:
-                    logger.info("Running speaker diarization (stream)...")
-                    processing_state.update_progress("diarizing_loading", percent=32)
-                    
-                    _min = min_speakers if min_speakers else (settings.DIARIZATION_MIN_SPEAKERS or None)
-                    _max = max_speakers if max_speakers else (settings.DIARIZATION_MAX_SPEAKERS or None)
-                    
-                    def on_diarization_progress(step: str, current: int = 0, total: int = 1, sub_percent: float = 0.0):
-                        base_percent = 35
-                        if step == "loading":
-                            percent = base_percent + int(sub_percent * 5)
-                        elif step == "processing":
-                            percent = 40 + int(sub_percent * 45)
-                        elif step == "chunk":
-                            chunk_progress = (current / total) if total > 0 else 0
-                            percent = 40 + int(chunk_progress * 45)
-                        elif step == "merging":
-                            percent = 85 + int(sub_percent * 3)
-                        else:
-                            percent = base_percent
-                        
-                        processing_state.update_progress(
-                            f"diarizing_{step}",
-                            percent=min(percent, 88),
-                            current_chunk=current,
-                            total_chunks=total
-                        )
-                    
-                    timeline = diarizer.diarize(
-                        str(temp_path),
-                        min_speakers=_min,
-                        max_speakers=_max,
-                        progress_callback=on_diarization_progress
-                    )
-                    
-                    if processing_state.cancel_requested:
-                        result_queue.put(("cancelled", "Traitement annulé par l'utilisateur"))
-                        return
-                    
-                    processing_state.update_progress("merging", percent=90)
-                    
-                    result["segments"] = diarizer.merge_with_transcription(
-                        result["segments"],
-                        timeline
-                    )
-                    
-                    result["text"] = segments_to_text(
-                        result["segments"],
-                        include_speakers=True
-                    )
-                    
-                    # Generate speaker samples for audio preview
-                    # Pass diarization timeline for confidence scoring
-                    speaker_samples = select_speaker_samples(
-                        result["segments"],
-                        diarization_timeline=timeline
-                    )
-                    if speaker_samples:
-                        # Generate a session ID for this transcription
-                        session_id = str(uuid.uuid4())
-                        result["session_id"] = session_id
-                        result["speaker_samples"] = speaker_samples
-                        
-                        # Cache the audio file for sample extraction
-                        # Move temp file to a more persistent location
-                        cache_path = Path(settings.UPLOAD_DIR) / f"cache_{session_id}{temp_path.suffix}"
-                        try:
-                            import shutil
-                            shutil.copy(str(temp_path), str(cache_path))
-                            audio_cache.store(session_id, str(cache_path), speaker_samples)
-                            logger.info(f"Cached audio for speaker samples: {session_id}")
-                        except Exception as e:
-                            logger.warning(f"Failed to cache audio for samples: {e}")
-                else:
-                    logger.warning("Diarization requested but not available")
             
             processing_state.update_progress("finalizing", percent=95)
             
@@ -890,11 +623,6 @@ async def _process_transcription_stream(
             # Save to history
             if processing_type == "file":
                 try:
-                    speakers_count = 0
-                    if diarize and result.get("segments"):
-                        speakers = set(s.get("speaker") for s in result["segments"] if s.get("speaker"))
-                        speakers_count = len(speakers)
-                    
                     processing_duration = round(time.time() - processing_start_time, 2)
                     
                     history_id = history.save_transcription(
@@ -903,8 +631,8 @@ async def _process_transcription_stream(
                         audio_duration=result.get("duration", 0),
                         language=result.get("language", "unknown"),
                         format=response_format,
-                        diarization=diarize,
-                        speakers_count=speakers_count,
+                        diarization=False,
+                        speakers_count=0,
                         segments_count=len(result.get("segments", [])),
                         result_text=result_content if isinstance(result_content, str) else json.dumps(result_content, ensure_ascii=False, indent=2),
                         result_json=result,
@@ -988,15 +716,10 @@ async def _process_transcription_stream(
                 # Send final progress
                 yield f"event: progress\ndata: {json.dumps({'step': 'complete', 'percent': 100})}\n\n"
                 
-                # Build result event with speaker samples if available
+                # Build result event
                 result_event = {'format': fmt, 'content': result_content}
                 
-                # Include speaker samples metadata for diarization
-                if full_result.get('session_id'):
-                    result_event['session_id'] = full_result['session_id']
-                if full_result.get('speaker_samples'):
-                    result_event['speaker_samples'] = full_result['speaker_samples']
-                # Include history ID for speaker naming sync
+                # Include history ID
                 if full_result.get('history_id'):
                     result_event['history_id'] = full_result['history_id']
                 
@@ -1024,9 +747,6 @@ async def _process_transcription(
     file: UploadFile,
     language: Optional[str],
     response_format: str,
-    diarize: bool,
-    min_speakers: Optional[int] = None,
-    max_speakers: Optional[int] = None,
     processing_type: str = "file"
 ) -> JSONResponse:
     """
@@ -1084,13 +804,13 @@ async def _process_transcription(
     # Flag to stop progress simulation
     stop_progress_sim = {"value": False}
     
-    def simulate_progress(file_size_mb: float, has_diarize: bool):
+    def simulate_progress(file_size_mb: float):
         """Simulate progress during Whisper transcription."""
         import time as time_mod
         
         estimated_seconds = max(10, file_size_mb * 6)
         start_percent = 5
-        end_percent = 28 if has_diarize else 85
+        end_percent = 85
         start_time = time_mod.time()
         
         while not stop_progress_sim["value"]:
@@ -1135,7 +855,7 @@ async def _process_transcription(
             stop_progress_sim["value"] = False
             progress_thread = Thread(
                 target=simulate_progress,
-                args=(file_size_mb, diarize)
+                args=(file_size_mb,)
             )
             progress_thread.start()
             
@@ -1155,7 +875,7 @@ async def _process_transcription(
             audio_duration = result.get("duration", 0)
             processing_state.update_progress(
                 "transcribing", 
-                percent=30 if diarize else 90,
+                percent=90,
                 audio_duration=audio_duration
             )
             
@@ -1163,85 +883,6 @@ async def _process_transcription(
             if processing_state.cancel_requested:
                 logger.info("Processing cancelled after transcription")
                 return {"error": "cancelled", "message": "Traitement annulé par l'utilisateur"}
-            
-            # Diarization if requested
-            if diarize:
-                if diarizer.is_available:
-                    logger.info("Running speaker diarization...")
-                    processing_state.update_progress("diarizing_loading", percent=32)
-                    
-                    _min = min_speakers if min_speakers else (settings.DIARIZATION_MIN_SPEAKERS or None)
-                    _max = max_speakers if max_speakers else (settings.DIARIZATION_MAX_SPEAKERS or None)
-                    
-                    def on_diarization_progress(step: str, current: int = 0, total: int = 1, sub_percent: float = 0.0):
-                        base_percent = 35
-                        if step == "loading":
-                            percent = base_percent + int(sub_percent * 5)
-                        elif step == "processing":
-                            percent = 40 + int(sub_percent * 45)
-                        elif step == "chunk":
-                            chunk_progress = (current / total) if total > 0 else 0
-                            percent = 40 + int(chunk_progress * 45)
-                        elif step == "merging":
-                            percent = 85 + int(sub_percent * 3)
-                        else:
-                            percent = base_percent
-                        
-                        processing_state.update_progress(
-                            f"diarizing_{step}",
-                            percent=min(percent, 88),
-                            current_chunk=current,
-                            total_chunks=total
-                        )
-                    
-                    timeline = diarizer.diarize(
-                        str(temp_path),
-                        min_speakers=_min,
-                        max_speakers=_max,
-                        progress_callback=on_diarization_progress
-                    )
-                    
-                    # Check for cancellation after diarization
-                    if processing_state.cancel_requested:
-                        logger.info("Processing cancelled after diarization")
-                        return {"error": "cancelled", "message": "Traitement annulé par l'utilisateur"}
-                    
-                    # Merge transcription with diarization
-                    processing_state.update_progress("merging", percent=90)
-                    
-                    result["segments"] = diarizer.merge_with_transcription(
-                        result["segments"],
-                        timeline
-                    )
-                    
-                    result["text"] = segments_to_text(
-                        result["segments"],
-                        include_speakers=True
-                    )
-                    
-                    # Generate speaker samples for audio preview
-                    # Pass diarization timeline for confidence scoring
-                    speaker_samples = select_speaker_samples(
-                        result["segments"],
-                        diarization_timeline=timeline
-                    )
-                    if speaker_samples:
-                        # Generate a session ID for this transcription
-                        session_id = str(uuid.uuid4())
-                        result["session_id"] = session_id
-                        result["speaker_samples"] = speaker_samples
-                        
-                        # Cache the audio file for sample extraction
-                        cache_path = Path(settings.UPLOAD_DIR) / f"cache_{session_id}{temp_path.suffix}"
-                        try:
-                            import shutil
-                            shutil.copy(str(temp_path), str(cache_path))
-                            audio_cache.store(session_id, str(cache_path), speaker_samples)
-                            logger.info(f"Cached audio for speaker samples: {session_id}")
-                        except Exception as e:
-                            logger.warning(f"Failed to cache audio for samples: {e}")
-                else:
-                    logger.warning("Diarization requested but not available")
             
             # Update progress: finalizing
             processing_state.update_progress("finalizing", percent=95)
@@ -1260,11 +901,6 @@ async def _process_transcription(
             history_id = None
             if processing_type == "file":
                 try:
-                    speakers_count = 0
-                    if diarize and result.get("segments"):
-                        speakers = set(s.get("speaker") for s in result["segments"] if s.get("speaker"))
-                        speakers_count = len(speakers)
-                    
                     processing_duration = round(time.time() - processing_start_time, 2)
                     
                     history_id = history.save_transcription(
@@ -1273,8 +909,8 @@ async def _process_transcription(
                         audio_duration=result.get("duration", 0),
                         language=result.get("language", "unknown"),
                         format=response_format,
-                        diarization=diarize,
-                        speakers_count=speakers_count,
+                        diarization=False,
+                        speakers_count=0,
                         segments_count=len(result.get("segments", [])),
                         result_text=result_content if isinstance(result_content, str) else json.dumps(result_content, ensure_ascii=False, indent=2),
                         result_json=result,
@@ -1326,170 +962,6 @@ async def _process_transcription(
         return PlainTextResponse(content=result_content, media_type="text/vtt")
     else:
         return JSONResponse(content=result_content)
-
-
-# ============================================
-# Speaker Audio Sample Endpoints
-# ============================================
-
-@app.get("/speaker-sample/{session_id}/{speaker_id}")
-async def get_speaker_sample(session_id: str, speaker_id: str):
-    """
-    Extract and serve an audio sample for a specific speaker.
-    
-    This endpoint extracts a short audio clip from the cached audio file
-    that corresponds to the best sample for the given speaker.
-    
-    Args:
-        session_id: The transcription session ID
-        speaker_id: The speaker identifier (e.g., SPEAKER_00)
-        
-    Returns:
-        Audio file (WAV format) containing the speaker sample
-    """
-    import subprocess
-    import tempfile
-    
-    # Get cached audio info
-    cache_entry = audio_cache.get(session_id)
-    if not cache_entry:
-        raise HTTPException(status_code=404, detail="Session expirée ou introuvable")
-    
-    file_path = cache_entry.get("file_path")
-    speaker_samples = cache_entry.get("speaker_samples", {})
-    
-    if not file_path or not Path(file_path).exists():
-        raise HTTPException(status_code=404, detail="Fichier audio introuvable")
-    
-    if speaker_id not in speaker_samples:
-        raise HTTPException(status_code=404, detail=f"Pas d'extrait disponible pour {speaker_id}")
-    
-    sample_info = speaker_samples[speaker_id]
-    start_time = sample_info["start"]
-    end_time = sample_info["end"]
-    duration = end_time - start_time
-    
-    # Create temporary file for the extracted sample
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
-        output_path = tmp_file.name
-    
-    try:
-        # Use ffmpeg to extract the audio segment
-        cmd = [
-            "ffmpeg",
-            "-y",  # Overwrite output
-            "-i", str(file_path),
-            "-ss", str(start_time),
-            "-t", str(duration),
-            "-acodec", "pcm_s16le",  # WAV format
-            "-ar", "16000",  # 16kHz sample rate
-            "-ac", "1",  # Mono
-            output_path
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, timeout=30)
-        
-        if result.returncode != 0:
-            logger.error(f"FFmpeg error: {result.stderr.decode()}")
-            raise HTTPException(status_code=500, detail="Erreur lors de l'extraction audio")
-        
-        # Read the extracted audio
-        async with aiofiles.open(output_path, 'rb') as f:
-            audio_data = await f.read()
-        
-        # Return as streaming response
-        return StreamingResponse(
-            iter([audio_data]),
-            media_type="audio/wav",
-            headers={
-                "Content-Disposition": f'inline; filename="{speaker_id}_sample.wav"',
-                "Cache-Control": "max-age=300"  # Cache for 5 minutes
-            }
-        )
-        
-    except subprocess.TimeoutExpired:
-        logger.error("FFmpeg timeout during audio extraction")
-        raise HTTPException(status_code=500, detail="Timeout lors de l'extraction")
-    except Exception as e:
-        logger.error(f"Audio extraction error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        # Clean up temp file
-        if Path(output_path).exists():
-            try:
-                os.remove(output_path)
-            except:
-                pass
-
-
-@app.get("/speaker-samples/{session_id}")
-async def get_session_speaker_samples(session_id: str):
-    """
-    Get the list of available speaker samples for a session.
-    
-    Args:
-        session_id: The transcription session ID
-        
-    Returns:
-        Dict with speaker samples info
-    """
-    cache_entry = audio_cache.get(session_id)
-    if not cache_entry:
-        raise HTTPException(status_code=404, detail="Session expirée ou introuvable")
-    
-    return {
-        "session_id": session_id,
-        "speaker_samples": cache_entry.get("speaker_samples", {}),
-        "expires_in_seconds": max(0, audio_cache.CACHE_DURATION_SECONDS - 
-            (datetime.now() - cache_entry["created_at"]).total_seconds())
-    }
-
-
-class RestoreSpeakerSamplesRequest(BaseModel):
-    speaker_samples: Dict[str, Any]
-
-
-@app.post("/speaker-samples/{session_id}/restore")
-async def restore_speaker_samples(session_id: str, request: RestoreSpeakerSamplesRequest):
-    """
-    Restore speaker samples metadata for a session.
-    Used after page refresh when the frontend has the samples but the server cache was lost.
-    
-    Args:
-        session_id: The transcription session ID
-        request: The speaker samples to restore
-        
-    Returns:
-        Success status
-    """
-    # First check if the audio file still exists (might have been recovered)
-    cache_entry = audio_cache.get(session_id)
-    
-    if cache_entry:
-        # Cache entry exists (recovered from file), restore the speaker samples
-        audio_cache.restore_speaker_samples(session_id, request.speaker_samples)
-        return {
-            "success": True, 
-            "message": "Speaker samples restored",
-            "expires_in_seconds": max(0, audio_cache.CACHE_DURATION_SECONDS - 
-                (datetime.now() - cache_entry["created_at"]).total_seconds())
-        }
-    else:
-        # No cache entry and file not found
-        raise HTTPException(status_code=404, detail="Session expirée ou fichier audio introuvable")
-
-
-@app.delete("/speaker-samples/{session_id}")
-async def cleanup_session_audio(session_id: str):
-    """
-    Manually cleanup audio cache for a session.
-    Called when user is done with speaker naming.
-    
-    Args:
-        session_id: The transcription session ID
-    """
-    audio_cache.remove(session_id)
-    return {"success": True, "message": "Cache nettoyé"}
 
 
 # ============================================
@@ -1704,7 +1176,8 @@ async def ollama_status():
         }
     
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        # Timeout increased to 15s for slow connections/cold starts
+        async with httpx.AsyncClient(timeout=15.0) as client:
             response = await client.get(f"{settings.OLLAMA_URL}/api/tags")
             
             if response.status_code == 200:
@@ -1731,16 +1204,28 @@ async def ollama_status():
                     "models": [],
                     "message": f"Erreur HTTP {response.status_code}"
                 }
-    except httpx.ConnectError:
+    except httpx.ConnectError as e:
+        logger.warning(f"Ollama connection error: {e}")
         return {
             "configured": True,
             "connected": False,
             "url": settings.OLLAMA_URL,
             "model": None,
             "models": [],
-            "message": "Impossible de se connecter à Ollama"
+            "message": f"Impossible de se connecter à Ollama ({settings.OLLAMA_URL})"
+        }
+    except httpx.TimeoutException as e:
+        logger.warning(f"Ollama timeout: {e}")
+        return {
+            "configured": True,
+            "connected": False,
+            "url": settings.OLLAMA_URL,
+            "model": None,
+            "models": [],
+            "message": f"Timeout lors de la connexion à Ollama"
         }
     except Exception as e:
+        logger.warning(f"Ollama status error: {e}")
         return {
             "configured": True,
             "connected": False,

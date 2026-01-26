@@ -38,12 +38,8 @@ function sttApp() {
         error: null,
         copied: false,
         
-        // Speaker naming
-        detectedSpeakers: [],
-        speakerNames: {},
-        speakerSamples: {},  // Speaker audio samples info
-        sessionId: null,     // Session ID for audio sample API
-        historyId: null,     // History record ID for speaker naming sync
+        // Client and history state
+        historyId: null,     // History record ID
         clientId: null,      // Client ID for result recovery after disconnect
         originalResult: null,
         
@@ -88,10 +84,7 @@ function sttApp() {
         // Options
         options: {
             language: '',
-            format: 'text',
-            diarize: false,
-            minSpeakers: '',
-            maxSpeakers: ''
+            format: 'text'
         },
         
         // History state
@@ -212,19 +205,10 @@ function sttApp() {
                 const formData = new FormData();
                 formData.append('file', this.selectedFile);
                 formData.append('response_format', this.options.format);
-                formData.append('diarize', this.options.diarize);
                 formData.append('client_id', this.clientId);
                 
                 if (this.options.language) {
                     formData.append('language', this.options.language);
-                }
-                
-                // Speaker constraints
-                if (this.options.diarize && this.options.minSpeakers) {
-                    formData.append('min_speakers', parseInt(this.options.minSpeakers));
-                }
-                if (this.options.diarize && this.options.maxSpeakers) {
-                    formData.append('max_speakers', parseInt(this.options.maxSpeakers));
                 }
                 
                 // Upload file with real progress tracking
@@ -245,20 +229,10 @@ function sttApp() {
                         ? JSON.stringify(data, null, 2)
                         : data.text;
                     
-                    if (this.options.diarize) {
-                        this.extractSpeakers(data);
-                        this.originalResult = this.result;
-                    }
                 } else {
                     data = await response.text();
                     this.result = data;
                     
-                    if (this.options.diarize) {
-                        // Use speaker metadata from SSE response for non-JSON formats
-                        const speakerMeta = response._speakerMeta || {};
-                        this.extractSpeakers(null, speakerMeta);
-                        this.originalResult = this.result;
-                    }
                 }
                 
                 this.stopProgressSimulation();
@@ -349,11 +323,6 @@ function sttApp() {
                             if (isJson) {
                                 try {
                                     jsonData = typeof result.content === 'string' ? JSON.parse(result.content) : result.content;
-                                    // Add speaker samples to JSON data
-                                    if (jsonData && typeof jsonData === 'object' && !Array.isArray(jsonData)) {
-                                        if (result.session_id) jsonData.session_id = result.session_id;
-                                        if (result.speaker_samples) jsonData.speaker_samples = result.speaker_samples;
-                                    }
                                 } catch (e) {
                                     console.error('Failed to parse JSON content:', e);
                                     jsonData = result.content;
@@ -373,8 +342,6 @@ function sttApp() {
                                 ),
                                 // Store metadata separately for non-JSON formats
                                 _speakerMeta: {
-                                    session_id: result.session_id,
-                                    speaker_samples: result.speaker_samples,
                                     history_id: result.history_id
                                 }
                             });
@@ -483,26 +450,6 @@ function sttApp() {
                         this.statusText = '🎤 Transcription en cours...';
                     }
                     break;
-                case 'diarizing_loading':
-                    this.statusText = '👥 Chargement du modèle de diarisation...';
-                    break;
-                case 'diarizing_processing':
-                    const subProgress = progress.percent >= 40 ? Math.round(((progress.percent - 40) / 45) * 100) : 0;
-                    this.statusText = `👥 Analyse des voix... ${Math.min(subProgress, 100)}%`;
-                    break;
-                case 'diarizing_chunk':
-                    if (progress.total_chunks > 0) {
-                        this.statusText = `👥 Diarisation: segment ${progress.current_chunk}/${progress.total_chunks}`;
-                    } else {
-                        this.statusText = '👥 Analyse des locuteurs...';
-                    }
-                    break;
-                case 'diarizing_merging':
-                    this.statusText = '👥 Harmonisation des locuteurs...';
-                    break;
-                case 'merging':
-                    this.statusText = '🔗 Fusion transcription et locuteurs...';
-                    break;
                 case 'finalizing':
                     this.statusText = '📝 Finalisation...';
                     break;
@@ -534,14 +481,7 @@ function sttApp() {
                         if (currentEvent === 'result') {
                             result.content = parsed.content;
                             result.format = parsed.format;
-                            // Extract speaker samples metadata
-                            if (parsed.session_id) {
-                                result.session_id = parsed.session_id;
-                            }
-                            if (parsed.speaker_samples) {
-                                result.speaker_samples = parsed.speaker_samples;
-                            }
-                            // Extract history ID for speaker naming sync
+                            // Extract history ID
                             if (parsed.history_id) {
                                 result.history_id = parsed.history_id;
                             }
@@ -566,19 +506,15 @@ function sttApp() {
          * Uses asymptotic progression that slows down as it approaches the limit
          * This provides a more realistic feel for variable-length processing
          * 
-         * Progress distribution (with diarization):
+         * Progress distribution:
          * - 0-5%: Upload complete, starting
-         * - 5-30%: Transcription
-         * - 30-35%: Loading diarization model
-         * - 35-85%: Diarization processing
-         * - 85-90%: Merging
+         * - 5-90%: Transcription
          * - 90-100%: Finalizing
          */
         startProcessingProgress() {
             // Estimate processing time based on file size (rough heuristic)
             const fileSizeMB = this.selectedFile ? this.selectedFile.size / (1024 * 1024) : 10;
-            // With diarization, processing takes much longer
-            const baseFactor = this.options.diarize ? 8 : 3;
+            const baseFactor = 3;
             const estimatedSeconds = Math.max(15, fileSizeMB * baseFactor);
             
             // Messages to display during processing (fallback when server doesn't report)
@@ -590,24 +526,6 @@ function sttApp() {
                 '🎤 Traitement des segments...'
             ];
             
-            const diarizationLoadingMessages = [
-                '👥 Chargement du modèle de diarisation...',
-                '👥 Préparation de l\'analyse des voix...'
-            ];
-            
-            const diarizationMessages = [
-                '👥 Analyse des voix...',
-                '👥 Identification des locuteurs...',
-                '👥 Séparation des intervenants...',
-                '👥 Détection des changements de locuteur...',
-                '👥 Attribution des segments...'
-            ];
-            
-            const mergingMessages = [
-                '🔗 Fusion des résultats...',
-                '🔗 Association texte et locuteurs...'
-            ];
-            
             const finalizationMessages = [
                 '📝 Formatage du résultat...',
                 '📝 Finalisation...',
@@ -617,10 +535,9 @@ function sttApp() {
             let elapsedTime = 0;
             let lastMessageChange = 0;
             let messageIndex = 0;
-            // Max progress depends on whether we're using diarization
-            const maxProgress = this.options.diarize ? 88 : 90;
+            const maxProgress = 90;
             
-            // Asymptotic function with adjusted speed for diarization
+            // Asymptotic function
             const k = 2.5 / estimatedSeconds;
             
             this.progressInterval = setInterval(() => {
@@ -648,26 +565,13 @@ function sttApp() {
                 if (shouldChangeMessage) {
                     lastMessageChange = elapsedTime;
                     
-                    // Determine which phase we're in based on progress (aligned with server steps)
-                    if (this.progress < 30) {
-                        // Transcription phase (5-30%)
+                    // Determine which phase we're in based on progress
+                    if (this.progress < 88) {
+                        // Transcription phase
                         this.statusText = transcriptionMessages[messageIndex % transcriptionMessages.length];
-                    } else if (this.options.diarize && this.progress < 38) {
-                        // Loading diarization model (30-38%)
-                        this.statusText = diarizationLoadingMessages[messageIndex % diarizationLoadingMessages.length];
-                    } else if (this.options.diarize && this.progress < 85) {
-                        // Diarization processing (38-85%)
-                        const subProgress = Math.round(((this.progress - 38) / 47) * 100);
-                        this.statusText = `${diarizationMessages[messageIndex % diarizationMessages.length]} ${subProgress}%`;
-                    } else if (this.options.diarize && this.progress < 90) {
-                        // Merging (85-90%)
-                        this.statusText = mergingMessages[messageIndex % mergingMessages.length];
-                    } else if (this.progress >= 88) {
+                    } else {
                         // Finalizing
                         this.statusText = finalizationMessages[Math.min(messageIndex % finalizationMessages.length, finalizationMessages.length - 1)];
-                    } else {
-                        // Default to transcription messages for non-diarization
-                        this.statusText = transcriptionMessages[messageIndex % transcriptionMessages.length];
                     }
                     messageIndex++;
                 }
@@ -757,16 +661,9 @@ function sttApp() {
          * Clear result and start fresh
          */
         clearResult() {
-            // Cleanup speaker samples cache
-            this.cleanupSpeakerSamples();
-            
             this.result = null;
             this.resultMeta = null;
             this.originalResult = null;
-            this.detectedSpeakers = [];
-            this.speakerNames = {};
-            this.speakerSamples = {};
-            this.sessionId = null;
             this.historyId = null;
             this.llmResult = '';
             this.llmLastPrompt = '';
@@ -838,213 +735,6 @@ function sttApp() {
         getLanguageName(code) {
             if (!code) return 'Inconnu';
             return this.languageNames[code] || code.toUpperCase();
-        },
-        
-        /**
-         * Extract unique speakers from result
-         * @param {Object} data - JSON response data (can be null for non-JSON formats)
-         * @param {Object} speakerMeta - Optional speaker metadata from SSE response
-         */
-        extractSpeakers(data, speakerMeta = {}) {
-            const speakers = new Set();
-            
-            // Try to extract from JSON segments
-            if (data && data.segments) {
-                data.segments.forEach(seg => {
-                    if (seg.speaker) {
-                        speakers.add(seg.speaker);
-                    }
-                });
-            }
-            
-            // Also extract from text using regex
-            if (typeof this.result === 'string') {
-                const matches = this.result.match(/SPEAKER_\d+/g) || [];
-                matches.forEach(s => speakers.add(s));
-            }
-            
-            // Sort speakers
-            this.detectedSpeakers = Array.from(speakers).sort();
-            
-            // Initialize speaker names
-            this.speakerNames = {};
-            this.detectedSpeakers.forEach(speaker => {
-                this.speakerNames[speaker] = '';
-            });
-            
-            // Extract speaker samples info from response data or speakerMeta
-            const samples = data?.speaker_samples || speakerMeta.speaker_samples;
-            const sessionId = data?.session_id || speakerMeta.session_id;
-            const historyId = data?.history_id || speakerMeta.history_id;
-            
-            if (samples) {
-                this.speakerSamples = samples;
-                this.sessionId = sessionId;
-                console.log('Speaker samples available:', Object.keys(this.speakerSamples));
-            } else {
-                this.speakerSamples = {};
-                this.sessionId = null;
-            }
-            
-            // Store history ID for speaker naming sync
-            this.historyId = historyId || null;
-            if (historyId) {
-                console.log('History ID for speaker naming:', historyId);
-            }
-        },
-        
-        /**
-         * Get the audio sample URL for a speaker
-         */
-        getSpeakerSampleUrl(speaker) {
-            if (!this.sessionId || !this.speakerSamples[speaker]) {
-                return null;
-            }
-            return `/speaker-sample/${this.sessionId}/${speaker}`;
-        },
-        
-        /**
-         * Check if a speaker has an audio sample available
-         */
-        hasSpeakerSample(speaker) {
-            return this.sessionId && this.speakerSamples[speaker];
-        },
-        
-        /**
-         * Get the sample text preview for a speaker
-         */
-        getSpeakerSampleText(speaker) {
-            const sample = this.speakerSamples[speaker];
-            if (!sample || !sample.text) return '';
-            
-            // Truncate if too long
-            const text = sample.text;
-            if (text.length > 80) {
-                return text.substring(0, 77) + '...';
-            }
-            return text;
-        },
-        
-        /**
-         * Get the sample duration for a speaker
-         */
-        getSpeakerSampleDuration(speaker) {
-            const sample = this.speakerSamples[speaker];
-            if (!sample) return '';
-            return `${sample.duration}s`;
-        },
-        
-        /**
-         * Play a speaker's audio sample
-         */
-        playSpeakerSample(speaker) {
-            const url = this.getSpeakerSampleUrl(speaker);
-            if (!url) return;
-            
-            // Stop any currently playing audio
-            const existingAudio = document.querySelector('audio.speaker-audio-player');
-            if (existingAudio) {
-                existingAudio.pause();
-                existingAudio.remove();
-            }
-            
-            // Create and play new audio
-            const audio = new Audio(url);
-            audio.className = 'speaker-audio-player';
-            audio.style.display = 'none';
-            document.body.appendChild(audio);
-            
-            audio.play().catch(err => {
-                console.error('Failed to play speaker sample:', err);
-            });
-            
-            // Remove when finished
-            audio.addEventListener('ended', () => {
-                audio.remove();
-            });
-        },
-        
-        /**
-         * Cleanup speaker samples cache when done
-         */
-        async cleanupSpeakerSamples() {
-            if (!this.sessionId) return;
-            
-            try {
-                await fetch(`/speaker-samples/${this.sessionId}`, {
-                    method: 'DELETE'
-                });
-                console.log('Speaker samples cache cleaned up');
-            } catch (err) {
-                console.debug('Failed to cleanup speaker samples:', err);
-            }
-            
-            this.sessionId = null;
-            this.speakerSamples = {};
-        },
-        
-        /**
-         * Apply speaker names to transcription
-         */
-        async applySpeakerNames() {
-            if (!this.originalResult) {
-                this.originalResult = this.result;
-            }
-            
-            let newResult = this.originalResult;
-            
-            // Replace speaker IDs with names
-            this.detectedSpeakers.forEach(speaker => {
-                const name = this.speakerNames[speaker]?.trim();
-                if (name) {
-                    // Replace in text
-                    const regex = new RegExp(speaker.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
-                    newResult = newResult.replace(regex, name);
-                }
-            });
-            
-            this.result = newResult;
-            
-            // Update history if we have a history ID
-            if (this.historyId && this.hasSpeakerNames()) {
-                try {
-                    const response = await fetch(`/history/${this.historyId}/speakers`, {
-                        method: 'PUT',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ speaker_names: this.speakerNames })
-                    });
-                    
-                    if (response.ok) {
-                        console.log('Speaker names saved to history');
-                    } else {
-                        console.warn('Failed to save speaker names to history');
-                    }
-                } catch (err) {
-                    console.warn('Failed to sync speaker names with history:', err);
-                }
-            }
-            
-            // Save state after applying names
-            this.saveState();
-        },
-        
-        /**
-         * Reset speaker names to original
-         */
-        resetSpeakerNames() {
-            if (this.originalResult) {
-                this.result = this.originalResult;
-            }
-            this.detectedSpeakers.forEach(speaker => {
-                this.speakerNames[speaker] = '';
-            });
-        },
-        
-        /**
-         * Check if any speaker has a name
-         */
-        hasSpeakerNames() {
-            return this.detectedSpeakers.some(s => this.speakerNames[s]?.trim());
         },
         
         // ===== DICTATION FUNCTIONS =====
@@ -1405,11 +1095,7 @@ function sttApp() {
                 resultMeta: this.resultMeta,
                 originalResult: this.originalResult,
                 
-                // Speaker data
-                detectedSpeakers: this.detectedSpeakers,
-                speakerNames: this.speakerNames,
-                speakerSamples: this.speakerSamples,
-                sessionId: this.sessionId,
+                // History data
                 historyId: this.historyId,
                 clientId: this.clientId,
                 
@@ -1470,12 +1156,8 @@ function sttApp() {
                     this.originalResult = state.originalResult;
                 }
                 
-                // Restore speaker data
-                if (state.detectedSpeakers?.length > 0) {
-                    this.detectedSpeakers = state.detectedSpeakers;
-                    this.speakerNames = state.speakerNames || {};
-                    this.speakerSamples = state.speakerSamples || {};
-                    this.sessionId = state.sessionId;
+                // Restore history ID
+                if (state.historyId) {
                     this.historyId = state.historyId;
                 }
                 
@@ -1553,64 +1235,6 @@ function sttApp() {
             return this._restoredFileInfo || null;
         },
         
-        /**
-         * Restore speaker samples on server after page refresh.
-         * If the server was restarted, it might have lost the speaker samples metadata
-         * but the audio file might still exist.
-         */
-        async restoreSpeakerSamplesOnServer() {
-            if (!this.sessionId || !this.speakerSamples || Object.keys(this.speakerSamples).length === 0) {
-                return;
-            }
-            
-            try {
-                // First check if samples are available on server
-                const checkResponse = await fetch(`/speaker-samples/${this.sessionId}`);
-                
-                if (checkResponse.ok) {
-                    const data = await checkResponse.json();
-                    // Check if server has the samples or just the file
-                    if (!data.speaker_samples || Object.keys(data.speaker_samples).length === 0) {
-                        // Server has file but no samples, restore them
-                        await this.doRestoreSpeakerSamples();
-                    } else {
-                        console.log('Speaker samples already available on server');
-                    }
-                } else if (checkResponse.status === 404) {
-                    // Session not found - try to restore
-                    await this.doRestoreSpeakerSamples();
-                }
-            } catch (err) {
-                console.warn('Failed to check/restore speaker samples on server:', err);
-            }
-        },
-        
-        /**
-         * Actually send the restore request to server
-         */
-        async doRestoreSpeakerSamples() {
-            try {
-                const response = await fetch(`/speaker-samples/${this.sessionId}/restore`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ speaker_samples: this.speakerSamples })
-                });
-                
-                if (response.ok) {
-                    console.log('Speaker samples restored on server');
-                } else {
-                    // Audio file expired or not found
-                    console.warn('Could not restore speaker samples - audio file may have expired');
-                    // Clear the sample data since it's not usable
-                    this.speakerSamples = {};
-                    this.sessionId = null;
-                    this.saveState();
-                }
-            } catch (err) {
-                console.warn('Failed to restore speaker samples:', err);
-            }
-        },
-        
         // ===== OLLAMA FUNCTIONS =====
         
         /**
@@ -1629,11 +1253,6 @@ function sttApp() {
             // If restored to history tab, load history immediately
             if (this.activeTab === 'history') {
                 this.loadHistory();
-            }
-            
-            // If state was restored with speaker samples, ensure they're available on server
-            if (stateRestored && this.sessionId && Object.keys(this.speakerSamples).length > 0) {
-                this.restoreSpeakerSamplesOnServer();
             }
             
             // Check server status immediately
@@ -1855,12 +1474,6 @@ function sttApp() {
                             };
                             this.historyId = cached.history_id;
                             
-                            // Extract speakers if diarization was enabled
-                            if (result?.segments && result.segments.some(s => s.speaker)) {
-                                this.extractSpeakers(result);
-                                this.originalResult = this.result;
-                            }
-                            
                             this.processing = false;
                             this.progress = 100;
                             this.statusText = '✅ Terminé ! (récupéré)';
@@ -1929,12 +1542,6 @@ function sttApp() {
                             };
                             this.historyId = fullItem.id;
                             
-                            // Extract speakers if diarization was enabled
-                            if (fullItem.diarization && fullItem.result_json) {
-                                this.extractSpeakers(fullItem.result_json);
-                                this.originalResult = this.result;
-                            }
-                            
                             this.processing = false;
                             this.progress = 100;
                             this.statusText = '✅ Terminé ! (récupéré de l\'historique)';
@@ -1990,31 +1597,6 @@ function sttApp() {
                     } else {
                         this.statusText = '🎤 Transcription en cours...';
                     }
-                    break;
-                case 'diarizing_loading':
-                    this.statusText = '👥 Chargement du modèle de diarisation...';
-                    break;
-                case 'diarizing_processing':
-                    // For short audio, show progress based on percent
-                    if (percent >= 40 && percent < 85) {
-                        const subProgress = Math.round(((percent - 40) / 45) * 100);
-                        this.statusText = `👥 Analyse des voix... ${subProgress}%`;
-                    } else {
-                        this.statusText = '👥 Analyse des voix en cours...';
-                    }
-                    break;
-                case 'diarizing_chunk':
-                    if (total > 0) {
-                        this.statusText = `👥 Diarisation: segment ${chunk}/${total}`;
-                    } else {
-                        this.statusText = '👥 Analyse des locuteurs...';
-                    }
-                    break;
-                case 'diarizing_merging':
-                    this.statusText = '👥 Harmonisation des locuteurs...';
-                    break;
-                case 'merging':
-                    this.statusText = '🔗 Fusion transcription et locuteurs...';
                     break;
                 case 'finalizing':
                     this.statusText = '📝 Finalisation...';

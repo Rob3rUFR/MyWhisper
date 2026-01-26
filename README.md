@@ -1,6 +1,6 @@
 # 🎤 MyWhisper - Transcription Audio avec IA
 
-Conteneur Docker plug-and-play pour la transcription audio utilisant **Faster Whisper Large v3** avec diarisation des speakers via **NVIDIA NeMo Sortformer** et post-traitement via **Ollama**.
+Conteneur Docker plug-and-play pour la transcription audio utilisant **Faster Whisper Large v3 Turbo** et post-traitement via **Ollama**.
 
 ![Python](https://img.shields.io/badge/Python-3.11-blue)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.110-green)
@@ -10,11 +10,9 @@ Conteneur Docker plug-and-play pour la transcription audio utilisant **Faster Wh
 ## ✨ Fonctionnalités
 
 ### Transcription
-- 🎯 **Faster Whisper Large v3** - Transcription rapide et précise
-- 👥 **Diarisation speakers** - Identification automatique des intervenants (NeMo Sortformer)
+- 🎯 **Faster Whisper Large v3 Turbo** - Transcription rapide et précise
 - 🌍 **Multi-langue** - Détection automatique ou sélection manuelle (50+ langues)
 - 📄 **Export multi-format** - JSON, TXT, SRT, VTT
-- ✏️ **Renommage speakers** - Personnaliser les noms des intervenants après transcription
 
 ### Dictée en temps réel
 - 🎙️ **Enregistrement micro** - Dictée vocale directement depuis le navigateur
@@ -34,13 +32,11 @@ Conteneur Docker plug-and-play pour la transcription audio utilisant **Faster Wh
 - 🔌 **API OpenAI-compatible** - Intégration directe avec Open WebUI
 - 🔄 **Persistance de l'état** - L'interface conserve son état après refresh
 - 📂 **Historique des transcriptions** - Gestion et téléchargement des anciennes transcriptions
-- 🎧 **Échantillons audio speakers** - Extrait audio pour identifier chaque intervenant
 
 ### Performance
 - 🚀 **GPU acceleration** - Optimisé CUDA avec TF32
 - 💪 **Support RTX 5090** - Compatible avec les derniers GPU NVIDIA
 - ⚡ **VAD intégré** - Filtrage automatique des silences
-- 🔗 **Fichiers longs** - Traitement par chunks avec harmonisation des speakers
 - 🔁 **Récupération auto** - Reprise après perte de connexion
 
 ## 🚀 Quick Start
@@ -50,7 +46,6 @@ Conteneur Docker plug-and-play pour la transcription audio utilisant **Faster Wh
 - Docker Desktop avec WSL2
 - NVIDIA Container Toolkit ([Installation guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html))
 - GPU CUDA-compatible (RTX 3000/4000/5000 series)
-- (Optionnel) Token Hugging Face pour d'autres modèles
 - (Optionnel) Ollama pour le post-traitement LLM
 
 ### Installation
@@ -62,7 +57,7 @@ cd MyWhisper
 
 # 2. Configuration
 copy env.example .env
-# Éditer .env si nécessaire (la diarisation fonctionne sans token)
+# Éditer .env si nécessaire
 
 # 3. Build & Run
 docker-compose up -d
@@ -72,13 +67,6 @@ docker-compose up -d
 # API: http://localhost:8000/v1/audio/transcriptions
 ```
 
-### Note sur la diarisation
-
-La diarisation utilise **NVIDIA NeMo Sortformer**, un modèle end-to-end qui :
-- Se télécharge automatiquement depuis NVIDIA NGC (pas de token requis)
-- Gère nativement les longs fichiers audio sans chunking manuel
-- Identifie jusqu'à 4 speakers automatiquement
-
 ## 📖 Utilisation
 
 ### Interface Web
@@ -87,11 +75,10 @@ Accéder à `http://localhost:8000` pour l'interface complète.
 
 #### Onglet Fichier
 1. Glisser-déposer un fichier audio/vidéo
-2. Sélectionner les options (langue, format, diarisation)
+2. Sélectionner les options (langue, format)
 3. Activer la sauvegarde automatique si souhaité
 4. Cliquer sur "Transcrire"
-5. Renommer les speakers si nécessaire
-6. Retraiter avec l'IA (Ollama) si configuré
+5. Retraiter avec l'IA (Ollama) si configuré
 
 #### Onglet Dictée
 1. Sélectionner la langue
@@ -108,7 +95,7 @@ Accéder à `http://localhost:8000` pour l'interface complète.
 
 #### Onglet Paramètres
 1. Configurer la durée de conservation de l'historique (1-365 jours)
-2. Configurer l'URL Ollama (ex: `http://localhost:11434`)
+2. Configurer l'URL Ollama (ex: `http://host.docker.internal:11434`)
 3. Sélectionner un modèle LLM
 4. Créer des prompts personnalisés avec `{text}` comme placeholder
 
@@ -120,10 +107,7 @@ Accéder à `http://localhost:8000` pour l'interface complète.
 curl -X POST http://localhost:8000/v1/audio/transcriptions \
   -F "file=@audio.mp3" \
   -F "language=fr" \
-  -F "response_format=json" \
-  -F "diarize=true" \
-  -F "min_speakers=2" \
-  -F "max_speakers=4"
+  -F "response_format=json"
 ```
 
 #### Réponse JSON
@@ -138,8 +122,7 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions \
       "id": 0,
       "start": 0.0,
       "end": 5.2,
-      "text": "Bonjour, aujourd'hui...",
-      "speaker": "SPEAKER_00"
+      "text": "Bonjour, aujourd'hui..."
     }
   ]
 }
@@ -153,14 +136,12 @@ curl -X POST http://localhost:8000/v1/audio/transcriptions \
 | `GET /health` | Health check (status GPU, modèles) |
 | `GET /v1/models` | Liste des modèles disponibles |
 | `POST /v1/audio/transcriptions` | Transcription OpenAI-compatible |
-| `POST /v1/audio/transcriptions/stream` | Transcription temps réel (dictée) |
+| `POST /v1/audio/transcriptions/stream` | Transcription avec SSE (évite timeout) |
 | `POST /transcribe` | Endpoint simplifié |
 | `GET /history` | Liste des transcriptions (pagination) |
 | `GET /history/{id}` | Détails d'une transcription |
 | `GET /history/{id}/download` | Télécharger (format: text/json/srt/vtt) |
 | `DELETE /history/{id}` | Supprimer une transcription |
-| `PUT /history/{id}/speakers` | Mettre à jour les noms des speakers |
-| `GET /speaker-sample/{session_id}/{speaker}` | Audio sample d'un speaker |
 | `GET /result/{client_id}` | Récupérer résultat après déconnexion |
 
 ## ⚙️ Configuration Open WebUI
@@ -194,14 +175,21 @@ networks:
 
 | Variable | Défaut | Description |
 |----------|--------|-------------|
-| `WHISPER_MODEL` | `large-v3` | Modèle Whisper à utiliser |
+| `WHISPER_MODEL` | `large-v3-turbo` | Modèle Whisper à utiliser |
 | `DEVICE` | `cuda` | Device (cuda/cpu) |
 | `COMPUTE_TYPE` | `float16` | Type de calcul (float16/int8) |
-| `HF_TOKEN` | - | Token Hugging Face (optionnel, pour autres modèles HF) |
-| `ENABLE_DIARIZATION` | `true` | Activer la diarisation |
 | `MAX_FILE_SIZE` | `524288000` | Taille max fichier (500MB) |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | URL de l'instance Ollama |
+| `OLLAMA_URL` | - | URL de l'instance Ollama |
 | `HISTORY_RETENTION_DAYS` | `90` | Durée conservation historique (jours) |
+
+### Modèles Whisper disponibles
+
+| Modèle | Vitesse | Qualité | VRAM |
+|--------|---------|---------|------|
+| `large-v3` | Référence | Meilleure | ~10GB |
+| `large-v3-turbo` | ~2-3x plus rapide | Légèrement inférieure | ~6GB |
+| `medium` | Rapide | Bonne | ~5GB |
+| `small` | Très rapide | Correcte | ~2GB |
 
 ### Optimisation GPU
 
@@ -233,10 +221,9 @@ MyWhisper/
 │   ├── __init__.py
 │   ├── main.py              # FastAPI app + routes
 │   ├── transcription.py     # Core STT logic (Faster Whisper)
-│   ├── diarization.py       # Speaker diarization (NeMo Sortformer)
 │   ├── history.py           # Gestion historique (SQLite)
-│   ├── patches.py           # Compatibility patches (PyTorch, torchaudio)
-│   ├── utils.py             # Helpers (formats, validation, speaker samples)
+│   ├── patches.py           # Compatibility patches (PyTorch)
+│   ├── utils.py             # Helpers (formats, validation)
 │   ├── config.py            # Configuration (Pydantic)
 │   │
 │   └── static/
@@ -265,11 +252,10 @@ Réduire la précision dans `.env` :
 COMPUTE_TYPE=int8
 ```
 
-### Diarisation échoue
-
-1. Vérifier que `ENABLE_DIARIZATION=true` dans `.env`
-2. S'assurer que le modèle NeMo peut être téléchargé (accès réseau)
-3. Vérifier les logs : `docker-compose logs -f`
+Ou utiliser un modèle plus petit :
+```env
+WHISPER_MODEL=medium
+```
 
 ### Erreur "weights_only" PyTorch
 
@@ -290,8 +276,9 @@ ports:
 ### Ollama non connecté
 
 1. Vérifier qu'Ollama est lancé : `ollama serve`
-2. Pour Docker, utiliser `host.docker.internal:11434` au lieu de `localhost`
-3. Ou ajouter Ollama au même réseau Docker
+2. **Important** : Ollama doit écouter sur `0.0.0.0` pour être accessible depuis Docker
+   - Définir `OLLAMA_HOST=0.0.0.0:11434` avant de lancer Ollama
+3. Utiliser `http://host.docker.internal:11434` dans `.env`
 
 ## 📊 Performance
 
@@ -300,11 +287,9 @@ ports:
 | Métrique | Valeur |
 |----------|--------|
 | Chargement modèle | ~5s |
-| Transcription 1min audio | < 5s |
-| Transcription 1h audio | ~8min |
-| VRAM usage (transcription) | ~4GB |
-| VRAM usage (+ diarisation) | ~6GB |
-| Diarisation overhead | +30-50% temps |
+| Transcription 1min audio | < 3s |
+| Transcription 1h audio | ~5min |
+| VRAM usage | ~4-6GB |
 
 ## 🔄 Commandes utiles
 
@@ -337,34 +322,24 @@ docker-compose restart
 
 ## 🆕 Changelog
 
+### v2.0.0 (Janvier 2026)
+- ❌ **Suppression de la diarisation** - Fonctionnalité retirée (non fiable)
+- ✅ **Modèle large-v3-turbo** - Transcription 2-3x plus rapide
+- ✅ **Interface simplifiée** - Plus d'options de diarisation
+- ✅ **Image Docker allégée** - Suppression des dépendances NeMo
+
 ### v1.2.0 (Janvier 2026)
 - ✅ **Historique des transcriptions** - Conservation avec durée configurable
-- ✅ **Échantillons audio speakers** - Extrait audio pour identifier chaque intervenant
-- ✅ **Persistance de l'état** - L'interface conserve son état après refresh (sessionStorage)
+- ✅ **Persistance de l'état** - L'interface conserve son état après refresh
 - ✅ **Récupération automatique** - Reprise des résultats après perte de connexion
-- ✅ **Harmonisation speakers** - Cohérence des IDs entre chunks pour fichiers longs (>10min)
-- ✅ **Anti-doublon échantillons** - Garantit des extraits audio uniques par speaker
-- ✅ **Verrouillage options** - Les options sont verrouillées pendant le traitement
-- ✅ **Amélioration UX** - Réorganisation interface speakers (ID → Input → Audio)
-
-### v1.1.0
-- ✅ Historique avec téléchargement multi-format
-- ✅ Sauvegarde des noms de speakers dans l'historique
-- ✅ Cache serveur pour récupération après déconnexion
-- ✅ Endpoint GET /result/{client_id}
 
 ### v1.0.0
 - ✅ Transcription Faster Whisper Large v3
-- ✅ Diarisation NeMo Sortformer
 - ✅ Interface web moderne (Alpine.js)
 - ✅ API OpenAI-compatible
 - ✅ Dictée en temps réel avec détection silence
 - ✅ Intégration Ollama pour post-traitement LLM
-- ✅ Renommage des speakers
-- ✅ Sauvegarde automatique (File System Access API)
-- ✅ Export formaté Word/Outlook
 - ✅ Support RTX 5090 (CUDA 12.4, PyTorch 2.9)
-- ✅ Optimisations TF32 et cuDNN
 
 ## 📜 Licence
 

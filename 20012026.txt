@@ -1,0 +1,49 @@
+Points abordés et décisions
+
+1. Problème de détection "Ollama" derrière un proxy NGIX
+
+Enjeu : Depuis la mise en place de MyWhisper derrière un proxy, la fonctionnalité "Ollama" ne fonctionne plus. Un message d'erreur "Error Failed Fetch" s'affiche, même en l'absence de connexion.
+Impact : Cela entraîne de nombreuses erreurs et perturbe le flux de travail.
+Action : Résoudre le problème de connexion/proxy pour rétablir la détection "Ollama".
+
+2. Gestion des conflits de traitement (fichiers et dictée)
+
+Enjeu : Nécessité de bloquer la dictée lorsqu'un fichier est en cours de traitement, ou d'établir une file d'attente pour éviter les conflits.
+
+Exemple : Si un utilisateur envoie une transcription via OpenWebUI pendant qu'un autre fichier est en cours de traitement, cela peut faire planter l'application, surtout avec des fichiers volumineux.
+
+Solution proposée :
+
+Afficher un message d'erreur clair (ex. : "Impossible de lancer la dictée : un fichier est en cours de traitement. Veuillez attendre la fin de l'opération.").
+Bloquer l'accès à la dictée (via l'interface ou l'API) pendant le traitement d'un fichier.
+
+Action : Implémenter un système de file d'attente ou de verrouillage.
+
+3. Gel de l'interface pendant le traitement des fichiers
+
+Enjeu : Lorsqu'un fichier est déposé dans l'onglet "Fichier" et que la transcription est lancée, l'interface doit être gelée pour éviter tout conflit avec la dictée.
+
+Exigence : Ajouter un bouton "Stop" pour interrompre le traitement en cours.
+Contrainte : Empêcher toute interaction avec la zone de dictée pendant le traitement d'un fichier.
+
+Action :
+
+Modifier l'interface pour geler les fonctionnalités non essentielles pendant le traitement.
+Ajouter un bouton "Stop" fonctionnel.
+
+
+4. Erreur 504 après traitement derrière un proxy
+
+Enjeu : Depuis la mise en place du proxy, une erreur 504 (timeout) survient après le traitement des fichiers.
+Action :
+
+Diagnostiquer la cause de l'erreur (ex. : délai d'attente trop court, problème de configuration du proxy).
+Ajuster les paramètres du serveur ou du proxy pour éviter ce timeout.
+
+
+5. Format de sauvegarde par défaut
+
+Enjeu : Le format par défaut doit être le texte brut (format le plus utilisé).
+Action : Modifier la configuration pour définir le texte brut comme format par défaut.
+
+6. Améliorer la barre de traitement car elle n'est pas du tout réaliste. 
