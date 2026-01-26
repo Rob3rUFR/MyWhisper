@@ -12,7 +12,6 @@ def apply_all_patches():
     """Apply all necessary compatibility patches."""
     _patch_torch_load()
     _patch_torchaudio()
-    _patch_pyannote_tf32()
 
 
 def _patch_torch_load():
@@ -57,9 +56,9 @@ def _patch_torch_load():
 
 def _patch_torchaudio():
     """
-    Patch torchaudio for compatibility with pyannote.audio.
+    Patch torchaudio for compatibility with older audio processing libraries.
     
-    torchaudio >= 2.5 removed several APIs that pyannote still uses.
+    torchaudio >= 2.5 removed several APIs that some libraries still use.
     """
     try:
         import torchaudio
@@ -147,65 +146,6 @@ def _patch_torchaudio():
         
     except Exception as e:
         print(f"[PATCH] Warning: Could not patch torchaudio: {e}", flush=True)
-
-
-def _patch_pyannote_tf32():
-    """
-    Patch pyannote to keep TF32 enabled for faster inference.
-    
-    pyannote.audio disables TF32 by default for reproducibility,
-    but TF32 is safe for inference and provides ~2-3x speedup.
-    """
-    try:
-        import warnings
-        import types
-        import sys
-        
-        # Suppress the pyannote TF32 warning
-        warnings.filterwarnings(
-            'ignore', 
-            message='.*TensorFloat-32.*',
-            category=UserWarning
-        )
-        warnings.filterwarnings(
-            'ignore',
-            category=UserWarning,
-            module='pyannote.*'
-        )
-        
-        # Create a fake reproducibility module with all expected functions
-        fake_module = types.ModuleType('pyannote.audio.utils.reproducibility')
-        
-        # Define ReproducibilityWarning
-        class ReproducibilityWarning(UserWarning):
-            pass
-        
-        fake_module.ReproducibilityWarning = ReproducibilityWarning
-        
-        # No-op functions that pyannote expects
-        def fix_reproducibility(pipeline):
-            """No-op: we want TF32 enabled for speed"""
-            return pipeline
-        
-        def assert_googol_precision():
-            """No-op: skip precision checks"""
-            pass
-        
-        def assert_no_tf32():
-            """No-op: we want TF32 enabled"""
-            pass
-        
-        fake_module.fix_reproducibility = fix_reproducibility
-        fake_module.assert_googol_precision = assert_googol_precision
-        fake_module.assert_no_tf32 = assert_no_tf32
-        
-        # Pre-register the fake module
-        sys.modules['pyannote.audio.utils.reproducibility'] = fake_module
-        
-        print("[PATCH] Patched pyannote reproducibility (TF32 will stay enabled)", flush=True)
-        
-    except Exception as e:
-        print(f"[PATCH] Warning: Could not patch pyannote TF32: {e}", flush=True)
 
 
 # Apply patches immediately when this module is imported

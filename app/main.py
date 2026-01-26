@@ -400,7 +400,7 @@ async def lifespan(app: FastAPI):
     if diarizer.is_available:
         logger.info("✅ Diarization available")
     else:
-        logger.warning("⚠️ Diarization unavailable (check HF_TOKEN)")
+        logger.warning("⚠️ Diarization unavailable (check ENABLE_DIARIZATION)")
     
     logger.info("=" * 50)
     logger.info("🚀 Service ready!")

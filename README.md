@@ -1,6 +1,6 @@
 # 🎤 MyWhisper - Transcription Audio avec IA
 
-Conteneur Docker plug-and-play pour la transcription audio utilisant **Faster Whisper Large v3** avec diarisation des speakers via **Pyannote** et post-traitement via **Ollama**.
+Conteneur Docker plug-and-play pour la transcription audio utilisant **Faster Whisper Large v3** avec diarisation des speakers via **NVIDIA NeMo Sortformer** et post-traitement via **Ollama**.
 
 ![Python](https://img.shields.io/badge/Python-3.11-blue)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.110-green)
@@ -11,7 +11,7 @@ Conteneur Docker plug-and-play pour la transcription audio utilisant **Faster Wh
 
 ### Transcription
 - 🎯 **Faster Whisper Large v3** - Transcription rapide et précise
-- 👥 **Diarisation speakers** - Identification automatique des intervenants (pyannote 3.1)
+- 👥 **Diarisation speakers** - Identification automatique des intervenants (NeMo Sortformer)
 - 🌍 **Multi-langue** - Détection automatique ou sélection manuelle (50+ langues)
 - 📄 **Export multi-format** - JSON, TXT, SRT, VTT
 - ✏️ **Renommage speakers** - Personnaliser les noms des intervenants après transcription
@@ -50,7 +50,7 @@ Conteneur Docker plug-and-play pour la transcription audio utilisant **Faster Wh
 - Docker Desktop avec WSL2
 - NVIDIA Container Toolkit ([Installation guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html))
 - GPU CUDA-compatible (RTX 3000/4000/5000 series)
-- Token Hugging Face (pour la diarisation)
+- (Optionnel) Token Hugging Face pour d'autres modèles
 - (Optionnel) Ollama pour le post-traitement LLM
 
 ### Installation
@@ -62,7 +62,7 @@ cd MyWhisper
 
 # 2. Configuration
 copy env.example .env
-# Éditer .env et ajouter votre HF_TOKEN
+# Éditer .env si nécessaire (la diarisation fonctionne sans token)
 
 # 3. Build & Run
 docker-compose up -d
@@ -72,15 +72,12 @@ docker-compose up -d
 # API: http://localhost:8000/v1/audio/transcriptions
 ```
 
-### Obtenir un token Hugging Face
+### Note sur la diarisation
 
-1. Créer un compte sur [huggingface.co](https://huggingface.co)
-2. Aller dans Settings > Access Tokens
-3. Créer un token avec accès en lecture
-4. **Important**: Accepter les conditions d'utilisation de :
-   - [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
-   - [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
-5. Ajouter le token dans votre fichier `.env`
+La diarisation utilise **NVIDIA NeMo Sortformer**, un modèle end-to-end qui :
+- Se télécharge automatiquement depuis NVIDIA NGC (pas de token requis)
+- Gère nativement les longs fichiers audio sans chunking manuel
+- Identifie jusqu'à 4 speakers automatiquement
 
 ## 📖 Utilisation
 
@@ -200,7 +197,7 @@ networks:
 | `WHISPER_MODEL` | `large-v3` | Modèle Whisper à utiliser |
 | `DEVICE` | `cuda` | Device (cuda/cpu) |
 | `COMPUTE_TYPE` | `float16` | Type de calcul (float16/int8) |
-| `HF_TOKEN` | - | Token Hugging Face (requis pour diarisation) |
+| `HF_TOKEN` | - | Token Hugging Face (optionnel, pour autres modèles HF) |
 | `ENABLE_DIARIZATION` | `true` | Activer la diarisation |
 | `MAX_FILE_SIZE` | `524288000` | Taille max fichier (500MB) |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | URL de l'instance Ollama |
@@ -236,7 +233,7 @@ MyWhisper/
 │   ├── __init__.py
 │   ├── main.py              # FastAPI app + routes
 │   ├── transcription.py     # Core STT logic (Faster Whisper)
-│   ├── diarization.py       # Speaker diarization (Pyannote)
+│   ├── diarization.py       # Speaker diarization (NeMo Sortformer)
 │   ├── history.py           # Gestion historique (SQLite)
 │   ├── patches.py           # Compatibility patches (PyTorch, torchaudio)
 │   ├── utils.py             # Helpers (formats, validation, speaker samples)
@@ -270,8 +267,8 @@ COMPUTE_TYPE=int8
 
 ### Diarisation échoue
 
-1. Vérifier que `HF_TOKEN` est défini dans `.env`
-2. Accepter les conditions sur Hugging Face (voir installation)
+1. Vérifier que `ENABLE_DIARIZATION=true` dans `.env`
+2. S'assurer que le modèle NeMo peut être téléchargé (accès réseau)
 3. Vérifier les logs : `docker-compose logs -f`
 
 ### Erreur "weights_only" PyTorch
@@ -358,7 +355,7 @@ docker-compose restart
 
 ### v1.0.0
 - ✅ Transcription Faster Whisper Large v3
-- ✅ Diarisation Pyannote 3.1
+- ✅ Diarisation NeMo Sortformer
 - ✅ Interface web moderne (Alpine.js)
 - ✅ API OpenAI-compatible
 - ✅ Dictée en temps réel avec détection silence

@@ -14,11 +14,11 @@ class Settings(BaseSettings):
     COMPUTE_TYPE: str = "float16"
     NUM_WORKERS: int = 4
     
-    # Diarization
+    # Diarization (NeMo Sortformer - no token required)
     ENABLE_DIARIZATION: bool = True
-    HF_TOKEN: str = ""  # Required if diarization enabled
+    HF_TOKEN: str = ""  # Optional, for other HuggingFace models
     DIARIZATION_MIN_SPEAKERS: int = 0  # 0 = auto-detect
-    DIARIZATION_MAX_SPEAKERS: int = 0  # 0 = auto-detect
+    DIARIZATION_MAX_SPEAKERS: int = 0  # 0 = auto-detect (max 4 for Sortformer)
     
     # Limits
     MAX_FILE_SIZE: int = 500 * 1024 * 1024  # 500MB

@@ -10,12 +10,11 @@ torch>=2.6.0
 torchaudio>=2.6.0
 torchcodec>=0.1.0
 
-# Hugging Face - pin version compatible with pyannote
-huggingface_hub>=0.24.0,<0.27.0
+# Hugging Face
+huggingface_hub>=0.24.0
 
-# Diarization
-pyannote.audio>=3.3.2
-speechbrain>=1.0.0
+# Diarization - NVIDIA NeMo Sortformer
+nemo_toolkit[asr]>=2.0.0
 
 # Utils
 pydub>=0.25.1
