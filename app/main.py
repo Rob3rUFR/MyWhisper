@@ -201,12 +201,68 @@ class ProcessingState:
 processing_state = ProcessingState()
 
 
+def cleanup_old_uploads(max_age_hours: int = 24, max_files: int = 5) -> int:
+    """
+    Clean up old upload files.
+    - Removes files older than max_age_hours
+    - Keeps only max_files most recent files
+    Returns number of files deleted.
+    """
+    upload_dir = Path(settings.UPLOAD_DIR)
+    if not upload_dir.exists():
+        return 0
+    
+    deleted_count = 0
+    now = time.time()
+    max_age_seconds = max_age_hours * 3600
+    
+    # Get all files (excluding .gitkeep)
+    files = []
+    for f in upload_dir.iterdir():
+        if f.is_file() and f.name != '.gitkeep':
+            try:
+                stat = f.stat()
+                files.append((f, stat.st_mtime, stat.st_size))
+            except Exception:
+                pass
+    
+    # Sort by modification time (newest first)
+    files.sort(key=lambda x: x[1], reverse=True)
+    
+    for i, (filepath, mtime, size) in enumerate(files):
+        age_seconds = now - mtime
+        should_delete = False
+        
+        # Delete if older than max_age_hours
+        if age_seconds > max_age_seconds:
+            should_delete = True
+            reason = f"older than {max_age_hours}h"
+        # Delete if exceeds max_files limit
+        elif i >= max_files:
+            should_delete = True
+            reason = f"exceeds {max_files} file limit"
+        
+        if should_delete:
+            try:
+                filepath.unlink()
+                deleted_count += 1
+                logger.info(f"🗑️ Deleted upload file ({reason}): {filepath.name} ({size / 1024 / 1024:.1f} MB)")
+            except Exception as e:
+                logger.warning(f"Failed to delete {filepath}: {e}")
+    
+    return deleted_count
+
+
 async def periodic_cache_cleanup():
-    """Background task to periodically clean up expired cache files."""
+    """Background task to periodically clean up expired cache files and old uploads."""
     while True:
         await asyncio.sleep(1800)  # Run every 30 minutes
         try:
             result_cache.cleanup_expired()
+            # Clean up uploads: files older than 24h OR more than 5 files
+            deleted = cleanup_old_uploads(max_age_hours=24, max_files=5)
+            if deleted > 0:
+                logger.info(f"🧹 Upload cleanup: {deleted} file(s) deleted")
         except Exception as e:
             logger.warning(f"Cache cleanup error: {e}")
 
@@ -231,6 +287,11 @@ async def lifespan(app: FastAPI):
         logger.info("✅ Whisper model ready")
     except Exception as e:
         logger.error(f"❌ Failed to load Whisper model: {e}")
+    
+    # Clean up old uploads at startup
+    deleted = cleanup_old_uploads(max_age_hours=24, max_files=5)
+    if deleted > 0:
+        logger.info(f"🧹 Startup cleanup: {deleted} old upload file(s) deleted")
     
     logger.info("=" * 50)
     logger.info("🚀 Service ready!")
