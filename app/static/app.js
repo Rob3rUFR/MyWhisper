@@ -340,10 +340,10 @@ function sttApp() {
                                 text: () => Promise.resolve(
                                     typeof result.content === 'string' ? result.content : JSON.stringify(result.content)
                                 ),
-                                // Store metadata separately for non-JSON formats
-                                _speakerMeta: {
-                                    history_id: result.history_id
-                                }
+                            // Store metadata
+                            _meta: {
+                                history_id: result.history_id
+                            }
                             });
                         } else {
                             reject(new Error('Réponse invalide du serveur'));
@@ -1327,7 +1327,7 @@ function sttApp() {
                         
                         // Show notification and switch to history
                         setTimeout(() => {
-                            if (confirm(`Le traitement a terminé pendant le rafraîchissement.\n\nFichier: ${lastItem.filename}\nLocuteurs: ${lastItem.speakers_count || 'N/A'}\n\nVoulez-vous voir le résultat dans l'historique ?`)) {
+                            if (confirm(`Le traitement a terminé pendant le rafraîchissement.\n\nFichier: ${lastItem.filename}\n\nVoulez-vous voir le résultat dans l'historique ?`)) {
                                 this.activeTab = 'history';
                                 this.loadHistory();
                                 this.viewHistoryItem(lastItem);

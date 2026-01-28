@@ -121,7 +121,7 @@ class ProcessingState:
     client_id: Optional[str] = None  # Client ID for result recovery
     
     # Progress tracking
-    current_step: str = "idle"  # 'uploading', 'transcribing', 'diarizing', 'finalizing'
+    current_step: str = "idle"  # 'uploading', 'transcribing', 'finalizing'
     progress_percent: int = 0
     total_chunks: int = 0
     current_chunk: int = 0
@@ -316,7 +316,7 @@ async def lifespan(app: FastAPI):
 # Create FastAPI application
 app = FastAPI(
     title="Whisper STT API",
-    description="Speech-to-Text service using Faster Whisper with speaker diarization",
+    description="Speech-to-Text service using Faster Whisper",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -820,7 +820,7 @@ async def _process_transcription(
     2. Validate file (format, size)
     3. Save temporarily in /uploads
     4. Run Whisper transcription (in thread)
-    5. Run diarization if requested (in thread)
+    5. Save to history
     6. Format response
     7. Cleanup temporary file
     """
@@ -1140,37 +1140,6 @@ async def delete_history_record(record_id: int):
         raise HTTPException(status_code=404, detail="Transcription not found")
     
     return {"success": True, "message": "Transcription deleted"}
-
-
-class SpeakerNamesRequest(BaseModel):
-    speaker_names: Dict[str, str]
-
-
-@app.put("/history/{record_id}/speakers")
-async def update_history_speakers(record_id: int, request: SpeakerNamesRequest):
-    """
-    Update speaker names in a transcription record.
-    Replaces SPEAKER_XX with the provided names.
-    
-    Args:
-        record_id: The transcription ID
-        request: Dict mapping speaker IDs to names (e.g., {"SPEAKER_00": "Jean"})
-        
-    Returns:
-        Success message
-    """
-    # Filter out empty names
-    speaker_names = {k: v for k, v in request.speaker_names.items() if v and v.strip()}
-    
-    if not speaker_names:
-        raise HTTPException(status_code=400, detail="Aucun nom de locuteur fourni")
-    
-    updated = history.update_speaker_names(record_id, speaker_names)
-    
-    if not updated:
-        raise HTTPException(status_code=404, detail="Transcription not found")
-    
-    return {"success": True, "message": "Speaker names updated", "updated_speakers": list(speaker_names.keys())}
 
 
 # ============================================
