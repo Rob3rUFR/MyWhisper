@@ -1,24 +1,21 @@
-# Core
+# Core API
 fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 python-multipart>=0.0.9
 pydantic-settings>=2.2.1
 
-# STT Engine - PyTorch is included in the NeMo base image
+# STT Engine
 faster-whisper>=1.0.3
-# torch and torchaudio are pre-installed in nvcr.io/nvidia/nemo image
 
-# Hugging Face
-huggingface_hub>=0.24.0
+# PyTorch with CUDA 12.4
+torch>=2.5.0
+torchaudio>=2.5.0
 
-# Diarization - NeMo is included in the nvcr.io/nvidia/nemo base image
-# Only install additional audio dependencies
-librosa>=0.10.0,<0.11.0
-soundfile>=0.12.0
+# Async HTTP client (for Ollama)
+httpx>=0.27.0
+aiofiles>=23.2.1
 
 # Utils
 pydub>=0.25.1
 python-dotenv>=1.0.1
-aiofiles>=23.2.1
-numpy>=1.23.0,<2.0
-httpx>=0.27.0
+numpy>=1.26.0,<2.0

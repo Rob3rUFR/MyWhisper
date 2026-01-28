@@ -1,24 +1,46 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .Python
-env/
-venv/
-.venv/
-.git/
-.gitignore
-*.md
-!README.md
-uploads/*
-outputs/*
-models/*
-.env
-.DS_Store
-*.log
-.idea/
-.vscode/
 *.egg-info/
 dist/
 build/
+
+# Virtual environments
+env/
+venv/
+.venv/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+
+# Docs (except README)
+*.md
+!README.md
+
+# Data directories (mounted as volumes)
+uploads/*
+!uploads/.gitkeep
+outputs/*
+!outputs/.gitkeep
+models/*
+
+# Config
+.env
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tests
 tests/
+*.test.py
